@@ -117,7 +117,7 @@ enum WatchCoexistence {
             store.execute(q)
         }
         let intervals = samples
-            .filter { isWatchSource($0.sourceRevision.source) }
+            .filter { isWatchRevision($0.sourceRevision) }
             .map { DateInterval(start: $0.startDate, end: $0.endDate) }
             .sorted { $0.start < $1.start }
         // Merge overlapping/adjacent.
@@ -138,9 +138,9 @@ enum WatchCoexistence {
         return await watchCovered(type: HKCategoryType(.sleepAnalysis), start: start, end: end)
     }
 
-    private static func isWatchSource(_ source: HKSource) -> Bool {
-        let product = source.sourceRevision.productType ?? ""
-        if product.hasPrefix("Watch") { return true }
-        return source.name.localizedCaseInsensitiveContains("watch")
+    private static func isWatchRevision(_ revision: HKSourceRevision) -> Bool {
+        // productType ("Watch7,4") lives on the revision, not on HKSource.
+        if let product = revision.productType, product.hasPrefix("Watch") { return true }
+        return revision.source.name.localizedCaseInsensitiveContains("watch")
     }
 }

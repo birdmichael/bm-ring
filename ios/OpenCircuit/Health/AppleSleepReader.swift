@@ -85,7 +85,7 @@ enum AppleSleepReader {
 
     private static func summarize(_ samples: [HKCategorySample], morning: Date) -> AppleSleepNight {
         // Prefer the Apple Watch source when several writers exist.
-        let watchSamples = samples.filter { isWatchSource($0.sourceRevision.source) }
+        let watchSamples = samples.filter { isWatchRevision($0.sourceRevision) }
         let use = watchSamples.isEmpty ? samples : watchSamples
         let sourceName = use.first?.sourceRevision.source.name ?? "Apple Health"
         // Sum seconds first, divide once — per-sample Int truncation would leak
@@ -115,10 +115,10 @@ enum AppleSleepReader {
                                inBedMinutes: m(inBed), sourceName: sourceName)
     }
 
-    private static func isWatchSource(_ source: HKSource) -> Bool {
-        // Same rule as WatchCoexistence — keep them in sync.
-        let product = source.sourceRevision.productType ?? ""
-        if product.hasPrefix("Watch") { return true }
-        return source.name.localizedCaseInsensitiveContains("watch")
+    private static func isWatchRevision(_ revision: HKSourceRevision) -> Bool {
+        // Same rule as WatchCoexistence — keep them in sync. productType
+        // ("Watch7,4") lives on the revision, not on HKSource.
+        if let product = revision.productType, product.hasPrefix("Watch") { return true }
+        return revision.source.name.localizedCaseInsensitiveContains("watch")
     }
 }
