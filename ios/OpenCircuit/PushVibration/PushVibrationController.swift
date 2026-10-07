@@ -264,3 +264,4 @@ extension Notification.Name {
     static let pushVibrationTokenUpdated = Notification.Name("pushvibe.tokenUpdated")
     static let pushVibrationOutcomeUpdated = Notification.Name("pushvibe.outcomeUpdated")
 }
+
