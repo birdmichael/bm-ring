@@ -40,6 +40,27 @@ APNS_PORT = 443
 
 _config = None
 
+# --- rate limiting (in-memory sliding window, per client IP) ---
+# /buzz without a limit is an open buzzer: one stray loop (or one curious
+# friend) can hammer APNs, get the app throttled by Apple, and buzz the ring
+# all night. Defaults: 10/min per IP, burst 3 in 10 s. Tune in config.json.
+_rate_buckets: dict[str, list[float]] = {}
+
+
+def rate_limited(ip: str, cfg) -> bool:
+    now = time.time()
+    per_min = int(cfg.get("rate_limit_per_minute", 10))
+    burst = int(cfg.get("rate_limit_burst", 3))
+    window = _rate_buckets.setdefault(ip, [])
+    # drop entries older than 60 s
+    while window and window[0] < now - 60:
+        window.pop(0)
+    recent_10s = sum(1 for t in window if t > now - 10)
+    if len(window) >= per_min or recent_10s >= burst:
+        return True
+    window.append(now)
+    return False
+
 
 def load_config(path="config.json"):
     global _config
@@ -123,6 +144,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         cfg = load_config()
         if self.path == "/buzz":
+            client_ip = self.client_address[0]
+            if rate_limited(client_ip, cfg):
+                return self._json(429, {"error": "rate limited: slow down"})
             try:
                 length = int(self.headers.get("Content-Length", 0))
                 body = json.loads(self.rfile.read(length) or b"{}")

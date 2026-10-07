@@ -45,13 +45,22 @@ enum BloodPressureReader {
 
         let sys = await fetch(sysType, predicate: predicate)
         let dia = await fetch(diaType, predicate: predicate)
-        // Pair by rounded-to-minute timestamp; a cuff writes both together.
-        var diaByMinute: [Int: HKQuantitySample] = [:]
-        for d in dia { diaByMinute[Int(d.startDate.timeIntervalSince1970 / 60)] = d }
+        // Pair systolic+diastolic written together. Cuffs write both at once, but
+        // timestamps can differ by seconds (or the two writes straddle a minute
+        // boundary), so match within a ±2 min window instead of exact-minute buckets.
+        // Each diastolic sample is used once (nearest wins).
+        var usedDia = Set<Int>()
         var out: [BloodPressureReading] = []
         for s in sys {
-            let key = Int(s.startDate.timeIntervalSince1970 / 60)
-            guard let d = diaByMinute[key] else { continue }
+            var best: (idx: Int, dist: Double)?
+            for (j, d) in dia.enumerated() where !usedDia.contains(j) {
+                let dist = abs(d.startDate.timeIntervalSince(s.startDate))
+                guard dist <= 120 else { continue }
+                if best == nil || dist < best!.dist { best = (j, dist) }
+            }
+            guard let match = best else { continue }
+            usedDia.insert(match.idx)
+            let d = dia[match.idx]
             out.append(BloodPressureReading(date: s.startDate,
                                             systolic: s.quantity.doubleValue(for: mmHg),
                                             diastolic: d.quantity.doubleValue(for: mmHg),

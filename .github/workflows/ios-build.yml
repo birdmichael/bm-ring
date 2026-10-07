@@ -1,0 +1,79 @@
+# iOS build check (bm-ring fork).
+#
+# Two layers, because the two halves of this repo have very different needs:
+#  1. OpenCircuitKit — pure Foundation Swift package. `swift build` + `swift test`
+#     run anywhere Swift exists; no Xcode project, no signing, no device.
+#  2. The app — XcodeGen generates the .xcodeproj from ios/project.yml, then
+#     xcodebuild compiles the full app (SwiftUI/UIKit/CoreBluetooth/HealthKit)
+#     for the simulator with signing disabled. This is the layer that catches
+#     mistakes in fork-added UI code.
+#  3. push-server — py_compile + a smoke import, so the relay can't rot silently.
+#
+# Runs on every push to master and every PR touching ios/, push-server/, or itself.
+
+name: iOS build check
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "ios/**"
+      - "push-server/**"
+      - ".github/workflows/ios-build.yml"
+  pull_request:
+    paths:
+      - "ios/**"
+      - "push-server/**"
+      - ".github/workflows/ios-build.yml"
+
+jobs:
+  kit:
+    name: OpenCircuitKit (swift build + test)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build package
+        working-directory: ios/OpenCircuitKit
+        run: swift build
+      - name: Run package tests
+        working-directory: ios/OpenCircuitKit
+        run: swift test
+
+  app:
+    name: App (xcodebuild, simulator, no signing)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select latest Xcode
+        run: |
+          XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          echo "Using $XCODE"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate project
+        working-directory: ios
+        run: xcodegen generate
+      - name: Build app for simulator
+        working-directory: ios
+        run: >
+          xcodebuild
+          -scheme OpenCircuit
+          -destination 'platform=iOS Simulator,name=iPhone 16'
+          -derivedDataPath /tmp/derivedData
+          CODE_SIGNING_ALLOWED=NO
+          build
+
+  push-server:
+    name: push-server (py_compile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile check
+        run: python -m py_compile push-server/server.py
+      - name: Dependencies install check
+        run: pip install -r push-server/requirements.txt
