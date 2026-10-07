@@ -168,6 +168,42 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
                                    intentIdentifiers: [],
                                    options: []),
         ])
+        // Push-to-Vibrate (bm-ring fork): register for remote pushes so the user's OWN
+        // relay server can buzz the ring. Registration is harmless without a server —
+        // no push ever arrives unless the user configures one. Silent pushes need no
+        // banner authorization; the token is only useful to the user's own relay.
+        DispatchQueue.main.async {
+            UIApplication.shared.registerForRemoteNotifications()
+        }
+    }
+
+    // MARK: - Push-to-Vibrate (bm-ring fork)
+
+    /// APNs gave us a device token — hand it to the push-vibration controller, which
+    /// stores it for the settings screen (the user pastes it into their relay server).
+    func application(_ application: UIApplication,
+                     didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
+        Task { @MainActor in
+            PushVibrationController.shared.didRegister(deviceToken: deviceToken)
+        }
+    }
+
+    func application(_ application: UIApplication,
+                     didFailToRegisterForRemoteNotificationsWithError error: Error) {
+        Task { @MainActor in
+            PushVibrationController.shared.didFailToRegister(error: error)
+        }
+    }
+
+    /// Silent push arrived (`aps.content-available: 1`). Route to the push-vibration
+    /// controller; it decides whether to buzz. ~30 s of background runtime from here.
+    func application(_ application: UIApplication,
+                     didReceiveRemoteNotification userInfo: [AnyHashable: Any],
+                     fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void) {
+        Task { @MainActor in
+            let handled = PushVibrationController.shared.handlePush(userInfo: userInfo)
+            completionHandler(handled ? .newData : .noData)
+        }
     }
 
     /// NOT delivered under the SwiftUI scene lifecycle — kept only as belt-and-braces against a

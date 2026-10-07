@@ -1,4 +1,11 @@
-# OpenCircuit
+# OpenCircuit — bm-ring fork
+
+> **Fork note:** this is [perezjuanj/OpenCircuit](https://github.com/perezjuanj/OpenCircuit)
+> plus **Push-to-Vibrate** — buzz your Gen 3 ring from anything that can do an HTTP
+> POST, via your own push relay. iOS blocks apps from reading system notifications,
+> so instead your server sends *this app* a push and the app buzzes the ring.
+> Setup: [`docs/PUSH_VIBRATION.md`](docs/PUSH_VIBRATION.md). Everything below is
+> upstream's README, unchanged.
 
 **Local-first wearables: RingConn + Amazfit Helio.** No-cloud health data for the
 **RingConn Gen 2/3 and Air** smart ring and the **Amazfit Helio Strap**: your iPhone reads the

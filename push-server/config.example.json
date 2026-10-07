@@ -1,0 +1,1 @@
+{"bundle_id":"com.yourcompany.bmring","device_token":"PASTE_FROM_APP_SETTINGS","host":"127.0.0.1","key_id":"YOUR_KEY_ID","p8_path":"/path/to/AuthKey_XXXXXXXXXX.p8","port":8902,"team_id":"YOUR_TEAM_ID","webhook_secret":"pick-a-long-random-string"}

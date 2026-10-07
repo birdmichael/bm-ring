@@ -103,6 +103,13 @@ struct DeviceInfoView: View {
                         Label("Vibration & alarm", systemImage: "alarm.waves.left.and.right")
                     }
                     .disabled(session?.ready != true)
+                    // Push-to-Vibrate (bm-ring fork): buzz the ring when the user's OWN
+                    // push relay sends this phone a push. Same Gen-3 motor gate as above.
+                    NavigationLink {
+                        PushVibrationSettingsView()
+                    } label: {
+                        Label("Push vibrations", systemImage: "bell.badge.waveform")
+                    }
                 }
                 Button(role: .destructive) {
                     showAirplaneConfirm = true
