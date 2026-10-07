@@ -102,12 +102,36 @@ measurement (ringlink's headline features are all there — this fork didn't nee
 port them). What's new here:
 
 - `PushVibrationController` — push → BLE buzz routing, reconnect-with-budget,
-  outcome recording
+  outcome recording, plus push-triggered background sync (`{"sync": true}`)
 - `PushVibrationSettingsView` — enable/pattern/count, token copy, status, test buzz
 - `AppDelegate` — APNs registration + silent-push handler
-- `Info.plist` — `remote-notification` background mode
-- `push-server/` — personal APNs relay with webhook endpoint
+- `Info.plist` — `remote-notification` background mode, location usage descriptions
+- `AppleSleepReader` + `AppleSleepRow` — Apple Health measured sleep (Watch staging
+  when present) shown on the sleep card, preferred over ring inference
+- `BloodPressureReader` + `BloodPressureTrendView` — real cuff readings from Apple
+  Health, trended (Trends tab). Never modelled.
+- `LocationWakeSync` + `KeepaliveSettingsView` — battery-friendly keepalive: the
+  Tesla trick at 1% of the cost (significant-change monitoring, not continuous
+  location), layered over push pings + the existing BGTask/BT-restoration wakes
+- `push-server/` — personal APNs relay with webhook endpoint (`/buzz` → buzz and/or sync)
 - This doc
+
+## Sync keepalive — the full picture
+
+iOS decides when background work runs; no app can fully control it. This fork
+layers every battery-cheap wake source so at least one fires often:
+
+| Wake source | Cost | Fires when |
+|---|---|---|
+| Silent-push ping (`{"sync": true}`) | ~0 idle; one 20 s drain per ping | your cron decides (e.g. every 30 min) |
+| Significant-change location | ~0 (cell radio already on) | you move ~500 m+ (throttled: 30 min) |
+| Bluetooth state restoration | ~0 | ring has traffic / comes in range |
+| BGAppRefresh / BGProcessingTask | ~0 | iOS feels like it |
+| Foreground open | — | you open the app |
+
+What we deliberately DON'T do: continuous background location (Tesla's actual
+approach — real battery cost, and wrong tradeoff for health sync that doesn't
+need car-key latency).
 
 Not ported (deliberately): Android's notification-listener buzz — impossible on iOS
 (system notifications are off-limits to third-party apps); multi-ring — upstream is

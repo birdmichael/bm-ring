@@ -45,6 +45,17 @@ struct TrendsView: View {
                     AllDayVitalsSection(points: data.points, tempUnitRaw: tempUnitRaw)
                     OCSectionHeader("Recent Readings", systemImage: "list.bullet.rectangle", tint: .secondary)
                     RecentReadingsSection(rows: data.recentRows)
+                    // bm-ring: real cuff BP from Apple Health (never modelled).
+                    NavigationLink {
+                        BloodPressureTrendView()
+                    } label: {
+                        HStack {
+                            Label("Blood Pressure", systemImage: "heart.text.square")
+                            Spacer()
+                            Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+                        }
+                        .padding(.vertical, 6)
+                    }
                 }
             }
             .padding()

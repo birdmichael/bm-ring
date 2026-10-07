@@ -776,6 +776,20 @@ struct ContentView: View {
                         }
                     }
                     .buttonStyle(.plain)
+                    // bm-ring: battery-friendly keepalive (push pings + movement wakes).
+                    DetailLink { KeepaliveSettingsView() } label: {
+                        card {
+                            HStack(spacing: 8) {
+                                Image(systemName: "antenna.radiowaves.left.and.right").foregroundStyle(.blue)
+                                Text("SYNC KEEPALIVE").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                                Spacer()
+                                Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+                            }
+                            Text("Keep sync fresh without draining battery")
+                                .font(.subheadline).foregroundStyle(.secondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
                     brandFooter
                 }
                 .padding()

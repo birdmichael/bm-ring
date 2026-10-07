@@ -257,7 +257,15 @@ final class HealthKitWriter {
     var authorizationReadTypes: Set<HKObjectType> {
         // Read sleepAnalysis so the iOS Sleep-schedule window (HealthKitSleepSchedule) works the
         // moment the HealthKit entitlement is enabled — no further auth change needed.
-        var read: Set<HKObjectType> = [HKCategoryType(.sleepAnalysis)]
+        // bm-ring: also read Apple-measured sleep staging (AppleSleepReader) and real
+        // cuff blood-pressure readings (BloodPressureReader). The BP *correlation* type
+        // stays excluded (unshareable, throws) — only the systolic/diastolic QUANTITY
+        // types are listed, which are plain readable quantities.
+        var read: Set<HKObjectType> = [
+            HKCategoryType(.sleepAnalysis),
+            HKQuantityType(.bloodPressureSystolic),
+            HKQuantityType(.bloodPressureDiastolic),
+        ]
         for type in allTypes {
             // Workouts and the GPS route series stay WRITE-ONLY, and NOT for safety — both are plain
             // `HKSampleType`s (HealthKit/HKObjectType.h) and both are readable. They are excluded

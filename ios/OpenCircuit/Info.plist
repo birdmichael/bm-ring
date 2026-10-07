@@ -60,6 +60,10 @@
 		<string>remote-notification</string>
 		<string>processing</string>
 	</array>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Used only for significant-change monitoring: iOS wakes the app when you move (~500 m+), so it can sync the ring opportunistically. Your position is never read precisely (3 km accuracy) and never leaves the phone.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Significant-change monitoring is an Always-only API. The app wakes on movement to sync your ring — no continuous tracking, no GPS fixes, nothing uploaded.</string>
 	<key>UIFileSharingEnabled</key>
 	<true/>
 	<key>UISupportedInterfaceOrientations~ipad</key>

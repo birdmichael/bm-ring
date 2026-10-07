@@ -943,6 +943,7 @@ struct SleepCardView: View {
     @ViewBuilder
     private func detailSection() -> some View {
         VStack(alignment: .leading, spacing: 8) {
+            AppleSleepRow()    // bm-ring: Apple Health measured sleep (Watch staging when present)
             perStageHR()       // #70 per-stage average HR
             stressRow()        // #71 overnight stress
             osaRow()           // #91 sleep-apnea SpO₂ (dense 0x48 assessment)

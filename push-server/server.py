@@ -13,9 +13,15 @@ Then:
     curl -X POST localhost:8902/buzz -H 'Content-Type: application/json' \\
         -d '{"pattern": "notification", "count": 2}'
 
+    # ...or trigger a background sync instead of (or with) a buzz:
+    curl -X POST localhost:8902/buzz -H 'Content-Type: application/json' \\
+        -d '{"sync": true}'
+
 Wire anything that can do an HTTP POST into /buzz: Home Assistant automations,
 Uptime Kuma webhooks, cron + curl, email filters, CI pipelines. Each POST becomes
-a buzz (if the app has Push vibrations enabled and the ring is nearby).
+a buzz (if the app has Push vibrations enabled and the ring is nearby) and/or a
+short background sync — a cron pinging {"sync": true} every 30 min is the
+battery-friendly keepalive (see the SYNC KEEPALIVE screen in the app).
 
 APNs auth uses token-based auth (.p8 key from the Apple Developer portal):
 no certificates to renew yearly, one key works for all your apps.
@@ -66,8 +72,10 @@ def provider_token(cfg):
     return token
 
 
-def send_push(cfg, pattern="notification", count=1, title=None, body=None):
-    """Send one push. Silent by default (buzz only); pass title/body for a banner too."""
+def send_push(cfg, pattern="notification", count=1, title=None, body=None, sync=False):
+    """Send one push. Silent by default (buzz only); pass title/body for a banner too.
+    sync=True asks the app to run a short background sync on wake (no buzz unless
+    pattern/count say so — {"sync": true} alone syncs silently)."""
     if pattern not in ("notification", "long"):
         raise ValueError("pattern must be 'notification' or 'long'")
     count = max(1, min(5, int(count)))
@@ -77,6 +85,8 @@ def send_push(cfg, pattern="notification", count=1, title=None, body=None):
         aps["alert"] = {"title": title or "Ring buzz", "body": body or ""}
         aps["sound"] = "default"
     payload = {"aps": aps, "buzz": {"pattern": pattern, "count": count}}
+    if sync:
+        payload["sync"] = True
 
     url = f"{APNS_HOST}:{APNS_PORT}/3/device/{cfg['device_token']}"
     headers = {
@@ -126,12 +136,14 @@ class Handler(BaseHTTPRequestHandler):
                 if provided != secret:
                     return self._json(403, {"error": "bad secret"})
             try:
+                body = body or {}
                 apns_id = send_push(
                     cfg,
                     pattern=body.get("pattern", "notification"),
                     count=body.get("count", 1),
                     title=body.get("title"),
                     body=body.get("body"),
+                    sync=bool(body.get("sync", False)),
                 )
             except ValueError as e:
                 return self._json(400, {"error": str(e)})
