@@ -94,7 +94,7 @@ final class LocationWakeSync: NSObject {
     private func handleWake() {
         let now = Date()
         if let last = lastWake, now.timeIntervalSince(last) < Self.minInterval {
-            log.debug("location wake throttled (last \(now.timeIntervalSince(last), format: .number)s ago)")
+            log.debug("location wake throttled (last \(Int(now.timeIntervalSince(last)))s ago)")
             return
         }
         defaults.set(now.timeIntervalSince1970, forKey: Key.lastWake)
