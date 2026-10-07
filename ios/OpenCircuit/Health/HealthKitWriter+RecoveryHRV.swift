@@ -106,7 +106,23 @@ extension HealthKitWriter {
     func flushScalars(store: LocalStore, device: SyncDeviceID, mirroredKinds: [MetricKind]?,
                       writesRegularHRV: Bool = RecoveryHRVDefaults.writesRegularCopy()) async -> ScalarFlushOutcome {
         var outcome = ScalarFlushOutcome()
-        let regularPending = (try? store.pendingHealthSamples(device: device, kinds: mirroredKinds)) ?? []
+        var regularPending = (try? store.pendingHealthSamples(device: device, kinds: mirroredKinds)) ?? []
+        // bm-ring Watch coexistence: per-interval exclusion for steps/activeEnergy.
+        // Samples the Watch already covered are withheld from the write AND
+        // watermarked as handled (the data exists in HealthKit via the Watch;
+        // retrying would only create the duplicates this prevents).
+        var coexistenceSkipped: [QuantitySample] = []
+        for kind in [MetricKind.steps, .activeEnergy] {
+            let kindSamples = regularPending.filter { $0.kind == kind }
+            guard !kindSamples.isEmpty,
+                  let hkType = Self.quantityType(for: kind) else { continue }
+            let filtered = await WatchCoexistence.filter(kindSamples, kind: kind, hkType: hkType)
+            if !filtered.skipped.isEmpty {
+                regularPending.removeAll { $0.kind == kind }
+                regularPending.append(contentsOf: filtered.kept)
+                coexistenceSkipped.append(contentsOf: filtered.skipped)
+            }
+        }
         let plan = Self.scalarWritePlan(regularPending: regularPending,
                                         recoveryHRVPending: { (try? store.pendingRecoveryHRVHealthSamples(device: device)) ?? [] },
                                         mirroredKinds: mirroredKinds, recoveryHRVType: recoveryHRVType,
@@ -116,6 +132,10 @@ extension HealthKitWriter {
             if !outcome.regular.written.isEmpty {
                 try? store.markHealthWritten(outcome.regular.written, device: device)   // advance ONLY for what actually saved
             }
+        }
+        if !coexistenceSkipped.isEmpty {
+            // Watermark the Watch-covered intervals as handled — see above.
+            try? store.markHealthWritten(coexistenceSkipped, device: device)
         }
         if let type = recoveryHRVType, !plan.recoveryHRV.isEmpty {
             outcome.recoveryHRV = await write(plan.recoveryHRV, timeline: device) {

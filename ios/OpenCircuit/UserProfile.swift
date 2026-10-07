@@ -262,6 +262,21 @@ struct UserProfileSettingsView: View {
             }
 
             Section("Apple Health") {
+                // bm-ring Watch coexistence: per-interval exclusion for steps, active
+                // energy, and sleep when the Watch already wrote that interval.
+                // Default ON — with no Watch it changes nothing.
+                Toggle(isOn: Binding(
+                    get: { WatchCoexistence.isEnabled },
+                    set: { WatchCoexistence.isEnabled = $0 }
+                )) {
+                    Label("Apple Watch coexistence", systemImage: "applewatch")
+                }
+                .tint(.green)
+                Text("When your Apple Watch already recorded steps, calories, or sleep for a " +
+                     "time period, the ring skips writing its own for that period — no doubled " +
+                     "steps in third-party apps, no gaps when the Watch is on its charger. " +
+                     "Heart rate, HRV, SpO₂ and other sampled metrics always sync.")
+                    .font(.caption).foregroundStyle(.secondary)
                 if healthAuthorized {
                     let missing = healthAttentionNames
                     if missing.isEmpty {

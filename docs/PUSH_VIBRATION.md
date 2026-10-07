@@ -113,6 +113,12 @@ port them). What's new here:
 - `LocationWakeSync` + `KeepaliveSettingsView` — battery-friendly keepalive: the
   Tesla trick at 1% of the cost (significant-change monitoring, not continuous
   location), layered over push pings + the existing BGTask/BT-restoration wakes
+- `WatchCoexistence` — Apple Watch coexistence, per-interval: before writing the
+  ring's steps / active energy / sleep for a time period, check whether the Watch
+  already wrote that type there. Covered → skip (no doubled steps in naive
+  third-party apps); gap → write (Watch on charger = ring fills in, nothing lost).
+  Sampled metrics (HR, HRV, SpO₂…) always sync. Toggle in Profile → Apple Health,
+  default ON (no Watch = zero behavior change)
 - `push-server/` — personal APNs relay with webhook endpoint (`/buzz` → buzz and/or sync)
 - This doc
 

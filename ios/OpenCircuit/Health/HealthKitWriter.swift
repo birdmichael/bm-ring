@@ -556,16 +556,29 @@ final class HealthKitWriter {
         if Self.ringOwnsNight(sleepSegments, store: store),
            SleepHealthGate.isReadyToWrite(latestSegmentEnd: sleepSegments.map(\.end).max(),
                                           now: Date(), finalized: sleepFinalized) {
-            switch await mirrorSettledNight(local: store, segments: sleepSegments) {
-            case .wrote(let count):
-                result.sleepSegments = count
-                writtenKinds.insert(.sleep)
-            case .unchanged, .declined:
-                break
-            case .failed:
-                // A denied .sleepAnalysis type (or a transient write error) — surface it (#135)
-                // instead of silently retrying, so the card can say "Sleep hasn't synced".
-                pendingFlushFailures.insert(.sleep)
+            // bm-ring Watch coexistence: if the Watch already wrote sleep for this
+            // night, the ring's estimate stays out of HealthKit (the user chose
+            // Apple's measured sleep as source of truth). Per-night, not per-day:
+            // a Watch charged overnight means the ring's night still lands.
+            let nightStart = sleepSegments.map(\.start).min()
+            let nightEnd = sleepSegments.map(\.end).max()
+            if let nightStart, let nightEnd,
+               await WatchCoexistence.watchCoveredNight(start: nightStart, end: nightEnd) {
+                // Don't write — and don't mark failed either; this is a deliberate
+                // skip, not an error. The night stays unwatermarked so a future
+                // flush re-checks (cheap), rather than baking in the skip.
+            } else {
+                switch await mirrorSettledNight(local: store, segments: sleepSegments) {
+                case .wrote(let count):
+                    result.sleepSegments = count
+                    writtenKinds.insert(.sleep)
+                case .unchanged, .declined:
+                    break
+                case .failed:
+                    // A denied .sleepAnalysis type (or a transient write error) — surface it (#135)
+                    // instead of silently retrying, so the card can say "Sleep hasn't synced".
+                    pendingFlushFailures.insert(.sleep)
+                }
             }
         }
         // The Helio Strap's staged nights (#215, decision 13), each through the same settled-night
