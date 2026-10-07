@@ -57,35 +57,68 @@ enum AppleSleepReader {
             let morning = cal.startOfDay(for: s.endDate)
             nights[morning, default: []].append(s)
         }
-        guard let latestMorning = nights.keys.max(),
-              let night = nights[latestMorning], !night.isEmpty else { return nil }
+        // Prefer the latest NIGHT (≥3 h asleep) over a recent nap: a 2 PM nap
+        // ending today must not outrank last night's real sleep.
+        let nightlike = nights.filter { asleepMinutes(in: $0.value) >= 180 }
+        let pool = nightlike.isEmpty ? nights : nightlike
+        guard let latestMorning = pool.keys.max(),
+              let night = pool[latestMorning], !night.isEmpty else { return nil }
         return summarize(night, morning: latestMorning)
     }
 
-    private static func summarize(_ samples: [HKCategorySample], morning: Date) -> AppleSleepNight {
-        var core = 0, deep = 0, rem = 0, unspecified = 0, awake = 0, inBed = 0
-        // Prefer the Apple Watch source when several writers exist.
-        let watchSamples = samples.filter { $0.sourceRevision.source.name.localizedCaseInsensitiveContains("watch") }
-        let use = watchSamples.isEmpty ? samples : watchSamples
-        let sourceName = use.first?.sourceRevision.source.name ?? "Apple Health"
-        for s in use {
-            let mins = Int(s.endDate.timeIntervalSince(s.startDate) / 60)
+    /// Total asleep seconds in a sample group (for night-vs-nap classification).
+    private static func asleepMinutes(in samples: [HKCategorySample]) -> Int {
+        var total: TimeInterval = 0
+        for s in samples {
             guard let v = HKCategoryValueSleepAnalysis(rawValue: s.value) else { continue }
             switch v {
-            case .asleepCore: core += mins
-            case .asleepDeep: deep += mins
-            case .asleepREM: rem += mins
-            case .asleepUnspecified: unspecified += mins
-            case .awake: awake += mins
-            case .inBed: inBed += mins
-            case .asleep: unspecified += mins  // legacy
+            case .asleepCore, .asleepDeep, .asleepREM, .asleepUnspecified, .asleep:
+                total += s.endDate.timeIntervalSince(s.startDate)
+            case .awake, .inBed:
+                break
+            @unknown default:
+                break
+            }
+        }
+        return Int(total / 60)
+    }
+
+    private static func summarize(_ samples: [HKCategorySample], morning: Date) -> AppleSleepNight {
+        // Prefer the Apple Watch source when several writers exist.
+        let watchSamples = samples.filter { isWatchSource($0.sourceRevision.source) }
+        let use = watchSamples.isEmpty ? samples : watchSamples
+        let sourceName = use.first?.sourceRevision.source.name ?? "Apple Health"
+        // Sum seconds first, divide once — per-sample Int truncation would leak
+        // several minutes per night.
+        var core: TimeInterval = 0, deep: TimeInterval = 0, rem: TimeInterval = 0
+        var unspecified: TimeInterval = 0, awake: TimeInterval = 0, inBed: TimeInterval = 0
+        for s in use {
+            let dur = s.endDate.timeIntervalSince(s.startDate)
+            guard let v = HKCategoryValueSleepAnalysis(rawValue: s.value) else { continue }
+            switch v {
+            case .asleepCore: core += dur
+            case .asleepDeep: deep += dur
+            case .asleepREM: rem += dur
+            case .asleepUnspecified: unspecified += dur
+            case .awake: awake += dur
+            case .inBed: inBed += dur
+            case .asleep: unspecified += dur  // legacy
             @unknown default: break
             }
         }
+        let m = { (t: TimeInterval) in Int(t / 60) }
+        let asleep = m(core) + m(deep) + m(rem) + m(unspecified)
         return AppleSleepNight(morning: morning,
-                               asleepMinutes: core + deep + rem + unspecified,
-                               coreMinutes: core, deepMinutes: deep, remMinutes: rem,
-                               unspecifiedMinutes: unspecified, awakeMinutes: awake,
-                               inBedMinutes: inBed, sourceName: sourceName)
+                               asleepMinutes: asleep,
+                               coreMinutes: m(core), deepMinutes: m(deep), remMinutes: m(rem),
+                               unspecifiedMinutes: m(unspecified), awakeMinutes: m(awake),
+                               inBedMinutes: m(inBed), sourceName: sourceName)
+    }
+
+    private static func isWatchSource(_ source: HKSource) -> Bool {
+        // Same rule as WatchCoexistence — keep them in sync.
+        let product = source.sourceRevision.productType ?? ""
+        if product.hasPrefix("Watch") { return true }
+        return source.name.localizedCaseInsensitiveContains("watch")
     }
 }

@@ -64,16 +64,11 @@ enum WatchCoexistence {
     /// True if any Apple Watch source wrote `type` overlapping [start, end].
     static func watchCovered(type: HKSampleType, start: Date, end: Date) async -> Bool {
         guard HKHealthStore.isHealthDataAvailable() else { return false }
-        let predicate = HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate)
-        let samples: [HKSample] = await withCheckedContinuation { cont in
-            // Limit 1: we only need existence, not the data.
-            let q = HKSampleQuery(sampleType: type, predicate: predicate, limit: 1,
-                                  sortDescriptors: nil) { _, result, _ in
-                cont.resume(returning: result ?? [])
-            }
-            store.execute(q)
-        }
-        return samples.contains { isWatchSource($0.sourceRevision.source) }
+        // No limit:1 shortcut here — the single returned sample could be the
+        // iPhone's own (it writes steps too), producing a false "not covered"
+        // even when Watch samples exist. Fetch the interval and check properly.
+        let intervals = await watchIntervals(type: type, start: start, end: end)
+        return !intervals.isEmpty
     }
 
     /// Filter ring samples: drop those whose interval the Watch already covered.

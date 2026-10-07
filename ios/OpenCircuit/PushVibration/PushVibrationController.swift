@@ -69,10 +69,22 @@ final class PushVibrationController {
         static let totalBuzzes = "pushvibe.totalBuzzes"
     }
 
-    /// How long (s) a background push waits for the BLE link before giving up.
-    /// Well inside the ~30 s silent-push budget, leaving margin for the vibrate write.
-    static let linkWaitBudget: TimeInterval = 20
-    static let maxCount = 5
+    /// One short, battery-cheap history drain on a push wake. No live-HR poll (the
+    /// optical warm-up alone would eat the budget); just drain + mirror to Health.
+    /// Best-effort by design — a missed wake is what the next wake is for.
+    /// Returns true if any data was captured.
+    private func runSync(timeout: TimeInterval) async -> Bool {
+        do {
+            let store = try OpenCircuitApp.backgroundStore()
+            let service = RingBackgroundSyncService(store: store, health: HealthKitWriter())
+            let ok = try await service.syncVitals(timeout: timeout, allowLivePoll: false)
+            log.info("push sync: finished (captured: \(ok))")
+            return ok
+        } catch {
+            log.warning("push sync failed: \(error.localizedDescription)")
+            return false
+        }
+    }
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -130,15 +142,24 @@ final class PushVibrationController {
 
     // MARK: - Push handling (MainActor; AppDelegate hops via Task)
 
-    /// Returns true if the push was ours (had a `buzz` key or feature on).
-    /// Callers use this for the fetchCompletionHandler result.
-    /// Must be called on the MainActor (AppDelegate hops there).
-    func handlePush(userInfo: [AnyHashable: Any]) -> Bool {
-        processPush(userInfo: userInfo)
-        return true
+    /// Handle a push, calling `completion` when all work is done (or the budget
+    /// is exhausted). The completion handler MUST NOT be called early: iOS
+    /// suspends the app once it's called, which would kill a BLE reconnect
+    /// still in flight. Total budget is bounded to ~25 s (inside the ~30 s
+    /// silent-push window).
+    func handlePush(userInfo: [AnyHashable: Any],
+                    completion: @escaping (UIBackgroundFetchResult) -> Void) {
+        Task {
+            let result = await self.processPush(userInfo: userInfo)
+            completion(result)
+        }
     }
 
-    private func processPush(userInfo: [AnyHashable: Any]) {
+    /// Overall deadline for one push: reconnect wait + sync share it.
+    private static let totalBudget: TimeInterval = 25
+    static let maxCount = 5
+
+    private func processPush(userInfo: [AnyHashable: Any]) async -> UIBackgroundFetchResult {
         recordPush()
         // bm-ring keepalive: a push can ALSO be a sync trigger ("sync": true).
         // The ~30 s background wake is then spent on a short history drain instead of
@@ -147,7 +168,10 @@ final class PushVibrationController {
         let wantsSync = (userInfo["sync"] as? Bool) == true
         let wantsBuzz = isEnabled
 
-        guard wantsBuzz || wantsSync else { return record(.blockedNotEnabled) }
+        guard wantsBuzz || wantsSync else {
+            record(.blockedNotEnabled)
+            return .noData
+        }
 
         // Per-push override, else the user's configured default.
         var pattern = self.pattern
@@ -162,50 +186,47 @@ final class PushVibrationController {
             }
         }
 
+        let deadline = Date().addingTimeInterval(Self.totalBudget)
         let scanner = RingScanner.shared
-        if let session = scanner.session, session.ready {
-            if wantsBuzz { buzz(session: session, pattern: pattern, count: count) }
-            if wantsSync { runSync() }
-            return
-        }
-        // Not connected — one reconnect attempt, then poll briefly for readiness.
-        log.info("push: no live session, attempting reconnect")
-        guard scanner.reconnectKnownPeripheral() else {
-            if wantsBuzz { record(.blockedNoRing) }
-            return
-        }
-        let deadline = Date().addingTimeInterval(Self.linkWaitBudget)
-        Task {
-            while Date() < deadline {
-                try? await Task.sleep(for: .seconds(1))
-                if Task.isCancelled { return }
-                if let session = RingScanner.shared.session, session.ready {
-                    if wantsBuzz { self.buzz(session: session, pattern: pattern, count: count) }
-                    if wantsSync { self.runSync() }
-                    return
+        var session = scanner.session
+        if session?.ready != true {
+            // Not connected — one reconnect attempt, then poll for readiness
+            // within the shared budget.
+            log.info("push: no live session, attempting reconnect")
+            if scanner.reconnectKnownPeripheral() {
+                while Date() < deadline {
+                    try? await Task.sleep(for: .seconds(1))
+                    if Task.isCancelled { return .failed }
+                    if let s = RingScanner.shared.session, s.ready {
+                        session = s
+                        break
+                    }
                 }
             }
-            if wantsBuzz {
-                self.record(.blockedLinkDown)
-                self.log.warning("push: ring never became ready within budget")
-            }
         }
-    }
 
-    /// One short, battery-cheap history drain on a push wake. No live-HR poll (the
-    /// optical warm-up alone would eat the budget); just drain + mirror to Health.
-    /// Best-effort by design — a missed wake is what the next wake is for.
-    private func runSync() {
-        Task {
-            do {
-                let store = try OpenCircuitApp.backgroundStore()
-                let service = RingBackgroundSyncService(store: store, health: HealthKitWriter())
-                let ok = try await service.syncVitals(timeout: 20, allowLivePoll: false)
-                self.log.info("push sync: finished (captured: \(ok))")
-            } catch {
-                self.log.warning("push sync failed: \(error.localizedDescription)")
+        guard let session, session.ready else {
+            if wantsBuzz {
+                record(.blockedNoRing)
+                log.warning("push: ring never became ready within budget")
+            }
+            return .failed
+        }
+
+        var result: UIBackgroundFetchResult = .noData
+        // Buzz first: it's instant, and vibrateBurst refuses while a sync is
+        // running — so the sync must not start first.
+        if wantsBuzz {
+            buzz(session: session, pattern: pattern, count: count)
+            result = .newData
+        }
+        if wantsSync, Date() < deadline {
+            let remaining = deadline.timeIntervalSince(Date())
+            if await runSync(timeout: min(20, remaining)) {
+                result = .newData
             }
         }
+        return result
     }
 
     private func buzz(session: RingSession, pattern: VibrationPattern, count: Int) {

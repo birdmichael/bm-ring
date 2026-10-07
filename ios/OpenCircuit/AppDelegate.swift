@@ -60,6 +60,13 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         // scanner is never constructed (decision 1); the strap's own central is re-created instead,
         // with its own restore identifier, so iOS can hand back its state; a restored or reconnected
         // strap syncs on connect, and the BGTask / Sleep Focus wakes drive it too (#215 phase 4).
+        // bm-ring keepalive: re-create the location wake singleton at launch. iOS
+        // relaunches the app in the background on significant-change events ONLY
+        // if a location manager exists to receive them — without this, wakes after
+        // app termination are silently lost. The init restarts monitoring only if
+        // the user had it enabled; otherwise this is a no-op that prompts nothing.
+        _ = LocationWakeSync.shared
+
         let helioActive = ActiveDeviceChoiceStore.persisted() == .helioStrap
         // Decision 33 (#233): a strap catch-up (woke-up event, reconnect, restoration, Health delivery)
         // runs the same alert passes as the strap's BGTask run. A static hook: setting it constructs
@@ -196,13 +203,14 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
     }
 
     /// Silent push arrived (`aps.content-available: 1`). Route to the push-vibration
-    /// controller; it decides whether to buzz. ~30 s of background runtime from here.
+    /// controller; it decides whether to buzz. The completion handler is called
+    /// only after the work finishes — calling it early would let iOS suspend the
+    /// app mid-reconnect. ~30 s of background runtime from here.
     func application(_ application: UIApplication,
                      didReceiveRemoteNotification userInfo: [AnyHashable: Any],
                      fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void) {
         Task { @MainActor in
-            let handled = PushVibrationController.shared.handlePush(userInfo: userInfo)
-            completionHandler(handled ? .newData : .noData)
+            PushVibrationController.shared.handlePush(userInfo: userInfo, completion: completionHandler)
         }
     }
 

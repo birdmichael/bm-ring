@@ -17,14 +17,14 @@ struct BloodPressureReading: Equatable, Identifiable {
     var diastolic: Double
     var sourceName: String
 
-    /// AHA-ish band for the systolic number, for color only — not a diagnosis.
+    /// AHA-ish band, for color only — not a diagnosis.
+    /// Stage 2: ≥140 or ≥90 · Stage 1: 130–139 or 80–89 ·
+    /// Elevated: 120–129 and <80 · Normal: <120 and <80.
     var band: String {
-        switch systolic {
-        case ..<120 where diastolic < 80: return "Normal"
-        case ..<130 where diastolic < 80: return "Elevated"
-        case ..<140, _ where diastolic < 90: return "High (1)"
-        default: return "High (2)"
-        }
+        if systolic >= 140 || diastolic >= 90 { return "High (2)" }
+        if systolic >= 130 || diastolic >= 80 { return "High (1)" }
+        if systolic >= 120 { return "Elevated" }  // diastolic < 80 implied here
+        return "Normal"
     }
 }
 

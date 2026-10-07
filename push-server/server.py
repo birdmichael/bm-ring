@@ -28,9 +28,10 @@ no certificates to renew yearly, one key works for all your apps.
 """
 
 import json
+import threading
 import time
 import urllib.parse
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
 import jwt  # PyJWT
@@ -45,21 +46,23 @@ _config = None
 # friend) can hammer APNs, get the app throttled by Apple, and buzz the ring
 # all night. Defaults: 10/min per IP, burst 3 in 10 s. Tune in config.json.
 _rate_buckets: dict[str, list[float]] = {}
+_rate_lock = threading.Lock()
 
 
 def rate_limited(ip: str, cfg) -> bool:
     now = time.time()
     per_min = int(cfg.get("rate_limit_per_minute", 10))
     burst = int(cfg.get("rate_limit_burst", 3))
-    window = _rate_buckets.setdefault(ip, [])
-    # drop entries older than 60 s
-    while window and window[0] < now - 60:
-        window.pop(0)
-    recent_10s = sum(1 for t in window if t > now - 10)
-    if len(window) >= per_min or recent_10s >= burst:
-        return True
-    window.append(now)
-    return False
+    with _rate_lock:
+        window = _rate_buckets.setdefault(ip, [])
+        # drop entries older than 60 s
+        while window and window[0] < now - 60:
+            window.pop(0)
+        recent_10s = sum(1 for t in window if t > now - 10)
+        if len(window) >= per_min or recent_10s >= burst:
+            return True
+        window.append(now)
+        return False
 
 
 def load_config(path="config.json"):
@@ -110,13 +113,15 @@ def send_push(cfg, pattern="notification", count=1, title=None, body=None, sync=
         payload["sync"] = True
 
     url = f"{APNS_HOST}:{APNS_PORT}/3/device/{cfg['device_token']}"
+    is_alert = "alert" in aps
     headers = {
         "authorization": f"bearer {provider_token(cfg)}",
         "apns-topic": cfg["bundle_id"],   # silent pushes: bare bundle id, no .voip
-        "apns-push-type": "background" if "alert" not in aps else "alert",
-        "apns-priority": "5",
+        "apns-push-type": "alert" if is_alert else "background",
+        # Background pushes MUST be priority 5 — 10 on a silent push risks throttling.
+        # Alert pushes get 10: when the user asked for a banner, they want it now.
+        "apns-priority": "10" if is_alert else "5",
     }
-    # NOTE: apns-priority 5 (not 10) for background pushes — 10 risks throttling.
     with httpx.Client(http2=True) as client:
         r = client.post(url, headers=headers, json=payload, timeout=15)
     if r.status_code != 200:
@@ -137,13 +142,17 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
-        if self.path == "/health":
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/health":
             return self._json(200, {"ok": True})
         return self._json(404, {"error": "use POST /buzz"})
 
     def do_POST(self):
         cfg = load_config()
-        if self.path == "/buzz":
+        # Strip query string BEFORE routing — otherwise "/buzz?secret=x" 404s
+        # and the secret-in-query path below would be dead code.
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/buzz":
             client_ip = self.client_address[0]
             if rate_limited(client_ip, cfg):
                 return self._json(429, {"error": "rate limited: slow down"})
@@ -155,7 +164,7 @@ class Handler(BaseHTTPRequestHandler):
             # Optional shared secret: set "webhook_secret" in config.json to require it.
             secret = cfg.get("webhook_secret")
             if secret:
-                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                qs = urllib.parse.parse_qs(parsed.query)
                 provided = self.headers.get("X-Webhook-Secret") or qs.get("secret", [None])[0]
                 if provided != secret:
                     return self._json(403, {"error": "bad secret"})
@@ -185,4 +194,6 @@ if __name__ == "__main__":
     host = cfg.get("host", "127.0.0.1")
     print(f"push relay listening on {host}:{port}  →  POST /buzz")
     print("example: curl -X POST localhost:8902/buzz -d '{\"pattern\":\"long\",\"count\":3}'")
-    HTTPServer((host, port), Handler).serve_forever()
+    # Threading: one slow APNs round-trip (15 s timeout) must not block /health
+    # or the next webhook.
+    ThreadingHTTPServer((host, port), Handler).serve_forever()
