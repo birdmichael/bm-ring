@@ -1467,8 +1467,8 @@ final class HealthKitWriter {
     static let activeBucketKcalKey = "hk.activeEnergy.bucketKcal"
     static let activeCarryKey = "hk.activeEnergy.carryKcal"
     static let activeBucketSeedDayKey = "hk.activeEnergy.bucketSeedDay"
-    private static let activeWorkoutCreditedKey = "hk.activeEnergy.workoutCreditedKcal"
-    private static let activeWorkoutCreditedDayKey = "hk.activeEnergy.workoutCreditedDay"
+    static let activeWorkoutCreditedKey = "hk.activeEnergy.workoutCreditedKcal"
+    static let activeWorkoutCreditedDayKey = "hk.activeEnergy.workoutCreditedDay"
     /// Total active kcal this app has actually SAVED to HealthKit today. Distinct from the bucket
     /// marks, which say only where energy sits: this is the day-total backstop that makes any
     /// bucket relocation incapable of re-paying kcal Health already holds.
@@ -1492,8 +1492,8 @@ final class HealthKitWriter {
     static let workoutWalkRunDistanceMetersKey = "hk.workoutWalkRunDistance.meters"
     static let workoutActiveKcalDayKey         = "hk.workoutActiveKcal.day"
     static let workoutActiveKcalKey            = "hk.workoutActiveKcal.kcal"
-    private static let estimateGPSCreditedDayKey    = "hk.distanceEstimate.gpsCreditedDay"
-    private static let estimateGPSCreditedMetersKey = "hk.distanceEstimate.gpsCreditedMeters"
+    static let estimateGPSCreditedDayKey    = "hk.distanceEstimate.gpsCreditedDay"
+    static let estimateGPSCreditedMetersKey = "hk.distanceEstimate.gpsCreditedMeters"
 
     /// Record foot-based workout GPS distance (meters) written to .distanceWalkingRunning today,
     /// so the daily steps×stride estimate can net it out and avoid double counting. Day-keyed.
@@ -1523,6 +1523,128 @@ final class HealthKitWriter {
             ? defaults.double(forKey: workoutActiveKcalKey) : 0
         defaults.set(today.timeIntervalSince1970, forKey: workoutActiveKcalDayKey)
         defaults.set(prior + kcal, forKey: workoutActiveKcalKey)
+    }
+
+    static let workoutCreditedSpansDayKey = "hk.workoutCreditedSpans.day"
+    static let workoutCreditedSpansKey    = "hk.workoutCreditedSpans.spans"
+
+    /// Record `[start, end]` of a workout whose active energy was just credited via
+    /// `recordWorkoutActiveKcal`, so the #281 motion gate can exempt it even when the workout left
+    /// no HR span rows in LocalStore for `ExerciseMinutes.recordedWorkoutIntervals` to find — a
+    /// confirmed ring-detected import, a crash-recovered orphan, or a live ring session whose HR
+    /// never locked (review-281 F1). Call this at the SAME call site as `recordWorkoutActiveKcal`,
+    /// with the same `summary.startDate`/`summary.endDate`, so the two can never drift apart.
+    /// Today-scoped like that credit — it resets when the day rolls, same lifetime as the thing it
+    /// protects.
+    static func recordWorkoutCreditedSpan(start: Date, end: Date, now: Date = Date(),
+                                          _ defaults: UserDefaults = .standard) {
+        guard end > start else { return }
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: now)
+        let storedDay = Date(timeIntervalSince1970: defaults.double(forKey: workoutCreditedSpansDayKey))
+        var spans: [[Double]] = cal.startOfDay(for: storedDay) == today
+            ? (defaults.array(forKey: workoutCreditedSpansKey) as? [[Double]] ?? []) : []
+        spans.append([start.timeIntervalSince1970, end.timeIntervalSince1970])
+        defaults.set(today.timeIntervalSince1970, forKey: workoutCreditedSpansDayKey)
+        defaults.set(spans, forKey: workoutCreditedSpansKey)
+    }
+
+    /// Today's credited workout spans (empty once the day rolls — see `recordWorkoutCreditedSpan`).
+    /// Feed this into `ExerciseMinutes.MotionEvidence.creditedWorkoutIntervals` at every TODAY-scoped
+    /// `Calories.dailyEstimate` call site (Trends' multi-day lookback already has its own, separate
+    /// exposure to this gap and is out of scope here, matching `recordWorkoutActiveKcal`'s own
+    /// today-only lifetime).
+    static func workoutCreditedSpans(day today: Date = Date(),
+                                     _ defaults: UserDefaults = .standard) -> [DateInterval] {
+        let cal = Calendar.current
+        let storedDay = Date(timeIntervalSince1970: defaults.double(forKey: workoutCreditedSpansDayKey))
+        guard cal.startOfDay(for: storedDay) == cal.startOfDay(for: today) else { return [] }
+        let raw = defaults.array(forKey: workoutCreditedSpansKey) as? [[Double]] ?? []
+        return raw.compactMap { pair in
+            guard pair.count == 2, pair[1] > pair[0] else { return nil }
+            return DateInterval(start: Date(timeIntervalSince1970: pair[0]),
+                                end: Date(timeIntervalSince1970: pair[1]))
+        }
+    }
+
+    // MARK: Undoing a deleted workout's credits (#293)
+    //
+    // The three record functions above bank a workout's kcal, span and walk/run GPS distance for
+    // TODAY. When the user deletes that workout from the history screen, the day's estimates must
+    // stop netting it out. Each helper below reverses exactly one record function, touches only
+    // today's slot (a stale or past-day slot is left alone: those credits already expired with
+    // their day), and returns whether it changed anything.
+    //
+    // A credit the active-energy flush already CONSUMED stays consumed: the daily samples Health
+    // holds were written net of it, and re-paying them is the flush's job, not this one's (see the
+    // #293 report). The consumed mark is lowered with the credit so the remaining credit stays
+    // coherent (credit − consumed = what is still owed), and so a later workout today is netted
+    // rather than hidden behind a consumed mark larger than the credit.
+
+    /// Bumped whenever a deleted workout's credits are undone, so the dashboard's cached estimates
+    /// (which key their recompute on their own inputs) recompute with the new credits.
+    static let workoutCreditsRevisionKey = "hk.workoutCredits.revision"
+
+    /// Reverse `recordWorkoutActiveKcal(kcal, day:)` for a workout that ended `day`.
+    @discardableResult
+    static func undoWorkoutActiveKcal(_ kcal: Double, day: Date, now: Date = Date(),
+                                      _ defaults: UserDefaults = .standard) -> Bool {
+        guard kcal > 0 else { return false }
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: now)
+        guard cal.startOfDay(for: day) == today else { return false }
+        let storedDay = Date(timeIntervalSince1970: defaults.double(forKey: workoutActiveKcalDayKey))
+        guard cal.startOfDay(for: storedDay) == today else { return false }
+        let credit = defaults.double(forKey: workoutActiveKcalKey)
+        guard credit > 0 else { return false }
+        defaults.set(max(0, credit - kcal), forKey: workoutActiveKcalKey)
+
+        let consumedDay = Date(timeIntervalSince1970: defaults.double(forKey: activeWorkoutCreditedDayKey))
+        if cal.startOfDay(for: consumedDay) == today {
+            let consumed = defaults.double(forKey: activeWorkoutCreditedKey)
+            defaults.set(max(0, consumed - kcal), forKey: activeWorkoutCreditedKey)
+        }
+        return true
+    }
+
+    /// Reverse `recordWorkoutCreditedSpan(start:end:)`: drop today's span matching `[start, end]`
+    /// (to the second; HealthKit round-trips dates through its own storage).
+    @discardableResult
+    static func removeWorkoutCreditedSpan(start: Date, end: Date, now: Date = Date(),
+                                          _ defaults: UserDefaults = .standard) -> Bool {
+        let cal = Calendar.current
+        let storedDay = Date(timeIntervalSince1970: defaults.double(forKey: workoutCreditedSpansDayKey))
+        guard cal.startOfDay(for: storedDay) == cal.startOfDay(for: now) else { return false }
+        let spans = defaults.array(forKey: workoutCreditedSpansKey) as? [[Double]] ?? []
+        let s = start.timeIntervalSince1970, e = end.timeIntervalSince1970
+        guard let index = spans.firstIndex(where: {
+            $0.count == 2 && abs($0[0] - s) < 1 && abs($0[1] - e) < 1
+        }) else { return false }
+        var kept = spans
+        kept.remove(at: index)
+        defaults.set(kept, forKey: workoutCreditedSpansKey)
+        return true
+    }
+
+    /// Reverse `recordWorkoutWalkRunDistance(meters)` for a workout whose GPS distance was banked today.
+    @discardableResult
+    static func undoWorkoutWalkRunDistance(_ meters: Double, now: Date = Date(),
+                                           _ defaults: UserDefaults = .standard) -> Bool {
+        guard meters > 0 else { return false }
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: now)
+        let storedDay = Date(timeIntervalSince1970: defaults.double(forKey: workoutWalkRunDistanceDayKey))
+        guard cal.startOfDay(for: storedDay) == today else { return false }
+        let total = defaults.double(forKey: workoutWalkRunDistanceMetersKey)
+        guard total > 0 else { return false }
+        defaults.set(max(0, total - meters), forKey: workoutWalkRunDistanceMetersKey)
+
+        let creditedDay = Date(timeIntervalSince1970: defaults.double(forKey: estimateGPSCreditedDayKey))
+        if cal.startOfDay(for: creditedDay) == today {
+            let credited = defaults.double(forKey: estimateGPSCreditedMetersKey)
+            defaults.set(max(0, credited - meters), forKey: estimateGPSCreditedMetersKey)
+        }
+        return true
     }
 
     private static func workoutActiveKcalCredited(day today: Date,
@@ -1597,14 +1719,40 @@ final class HealthKitWriter {
         return stored.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
     }
 
-    /// Write one resting-HR sample per finalized day not yet covered by the day-watermark.
+    /// Write one resting-HR sample per finalized day not yet covered by the day-watermark, skipping a
+    /// day whose value would come from too few daytime readings (`RestingHR.dayCoverage`, #298).
     /// Uses pre-fetched HR samples (shared with `flushPassiveCalories`) to avoid a redundant
     /// LocalStore query.
     private func flushRestingHR(prefetchedHR: [HRSample], sleepSegments: [SleepSegment]) async -> Int {
-        let cal = Calendar.current
-        let now = Date()
         let defaults = UserDefaults.standard
         let lastWritten = Date(timeIntervalSince1970: defaults.double(forKey: Self.rhrWatermarkKey))
+        let plan = Self.restingHRWritePlan(hr: prefetchedHR, sleepSegments: sleepSegments,
+                                           lastWritten: lastWritten, now: Date(), calendar: .current)
+        let outcome = await Self.writeRestingHRDays(plan, lastWritten: lastWritten) {
+            try await self.writeRestingHR(bpm: $0, day: $1)
+        }
+        if outcome.failed { pendingFlushFailures.insert(.restingHeartRate) }  // surface
+        if outcome.watermark > lastWritten {
+            defaults.set(outcome.watermark.timeIntervalSince1970, forKey: Self.rhrWatermarkKey)
+        }
+        return outcome.written
+    }
+
+    /// One finalized day after the resting-HR watermark that has readings, and the value to write
+    /// for it; `bpm` nil = below `RestingHR.dayCoverage` (#298), so it is not written.
+    struct RestingHRPlanDay: Equatable {
+        let day: Date
+        let bpm: Double?
+    }
+
+    /// The finalized days `flushRestingHR` considers, ascending. Pure, for tests.
+    ///
+    /// #298 (Juan, 2026-10-12): a day whose value would come from the daytime `lowestSustained` tier
+    /// on fewer readings, or a shorter span, than `RestingHR.dayCoverage` is NOT written: a few awake
+    /// readings synced before the night are not that day's resting HR. Days the sleep-mean tier
+    /// answers are unchanged, and so is every value that is written.
+    static func restingHRWritePlan(hr prefetchedHR: [HRSample], sleepSegments: [SleepSegment],
+                                   lastWritten: Date, now: Date, calendar cal: Calendar) -> [RestingHRPlanDay] {
         let cutoff = now.addingTimeInterval(-Self.restingFinalizationDelay)
         // Bound the scan: never re-read already-written days, and look back at most a week so a
         // first run backfills recent history without an unbounded query.
@@ -1612,22 +1760,37 @@ final class HealthKitWriter {
             ?? now.addingTimeInterval(-7 * 86_400)
         let scanStart = max(lookback, lastWritten)
         let hr = prefetchedHR.filter { $0.start >= scanStart }
-        guard !hr.isEmpty else { return 0 }
-        let days = RestingHR.dailyValues(hr: hr, sleep: sleepSegments, calendar: cal)
+        guard !hr.isEmpty else { return [] }
+        let all = RestingHR.dailyValues(hr: hr, sleep: sleepSegments, calendar: cal)
+        let covered = RestingHR.dailyValues(hr: hr, sleep: sleepSegments, calendar: cal,
+                                            daytimeCoverage: RestingHR.dayCoverage)
+        let coveredBpm = Dictionary(covered.map { ($0.day, $0.bpm) }, uniquingKeysWith: { a, _ in a })
+        return all.filter { $0.day > lastWritten && $0.day <= cutoff }   // days ascend
+            .map { RestingHRPlanDay(day: $0.day, bpm: coveredBpm[$0.day]) }
+    }
 
+    /// Write `plan` in order through `write`, stopping at the first failure. The watermark moves
+    /// only onto a day that was WRITTEN:
+    /// - a thin day before a written one ends up behind the watermark and is never written, even if
+    ///   its readings fill in later;
+    /// - a thin day after the last written one stays eligible, so if more of its readings arrive
+    ///   (typically the night, synced late) a later flush writes its full value — at most a week
+    ///   back, the scan's lookback;
+    /// - a written day is never rewritten: everything at or before the watermark is out of the plan.
+    static func writeRestingHRDays(_ plan: [RestingHRPlanDay], lastWritten: Date,
+                                   write: (Double, Date) async throws -> Void)
+    async -> (written: Int, watermark: Date, failed: Bool) {
         var written = 0
-        var newWatermark = lastWritten
-        for d in days where d.day > lastWritten && d.day <= cutoff {  // days ascend
+        var watermark = lastWritten
+        for d in plan {
+            guard let bpm = d.bpm else { continue }   // thin (#298): not written, watermark stays
             do {
-                try await writeRestingHR(bpm: d.bpm, day: d.day)
+                try await write(bpm, d.day)
                 written += 1
-                newWatermark = d.day
-            } catch { pendingFlushFailures.insert(.restingHeartRate); break }  // surface; stop, already-written days stay covered
+                watermark = d.day
+            } catch { return (written, watermark, true) }  // stop; already-written days stay covered
         }
-        if newWatermark > lastWritten {
-            defaults.set(newWatermark.timeIntervalSince1970, forKey: Self.rhrWatermarkKey)
-        }
-        return written
+        return (written, watermark, false)
     }
 
     /// How far back the basal-energy path reads daily resting HR: enough to hold the personal
@@ -1768,7 +1931,11 @@ final class HealthKitWriter {
             stepWindows: stepSamples.map {
                 StepWindow(start: $0.start, end: $0.end, delta: $0.delta)
             },
-            dayStart: today
+            dayStart: today,
+            // #281 motion gate (off by default): the ring's own activity sessions, for the walks a
+            // suspended app saw no steps for.
+            activityIntervals: RingActivityEventLedger.load().corroboratingIntervals(now: now),
+            creditedWorkoutIntervals: Self.workoutCreditedSpans(day: today)
         )
 
         // Time-attributed path. Falls through to the single-delta path below when attribution
@@ -1988,7 +2155,8 @@ final class HealthKitWriter {
     /// BMR/TRIMP energy estimates; the ring transmits none of these inputs.
     static func storedUserProfile(_ defaults: UserDefaults = .standard) -> UserProfile {
         let age = defaults.object(forKey: "userProfile.age") as? Int ?? 35
-        let weightKg = defaults.object(forKey: "userProfile.weightKg") as? Double ?? 70
+        // Manual weight, or the cached Apple Health body mass when that is newer (#284).
+        let weightKg = WeightResolver.resolve(defaults: defaults).kg
         let heightCm = defaults.object(forKey: "userProfile.heightCm") as? Double ?? 170
         let sexRaw = defaults.string(forKey: "userProfile.sex") ?? BiologicalSex.male.rawValue
         return UserProfile(age: age, weightKg: max(weightKg, 1), heightCm: max(heightCm, 1),
@@ -2025,8 +2193,16 @@ final class HealthKitWriter {
         }
         let hrSamples = rawSamples.map { HRSample(bpm: Int($0.value), start: $0.start, end: $0.end) }
         let maxHR = max(220 - profile.age, 1)
+        // The same motion evidence `flushActiveCalories` hands `Calories.dailyEstimate`, so with the
+        // #281 gate on the minutes and the energy share one qualifying set.
+        let stepWindows = ((try? local.stepSamples(from: today.addingTimeInterval(-86_400), to: now)) ?? [])
+            .map { StepWindow(start: $0.start, end: $0.end, delta: $0.delta) }
+        let motion = ExerciseMinutes.MotionEvidence(
+            stepWindows: stepWindows,
+            activityIntervals: RingActivityEventLedger.load().corroboratingIntervals(now: now),
+            creditedWorkoutIntervals: Self.workoutCreditedSpans(day: today))
         let totalMin = ExerciseMinutes.estimate(hrSamples: hrSamples, maxHR: maxHR,
-                                                sleepWindow: sleepWindow)
+                                                sleepWindow: sleepWindow, motion: motion)
         let pendingMin = totalMin - writtenMin
         guard pendingMin >= 1.0 else {
             defaults.set(today.timeIntervalSince1970, forKey: Self.exerciseDayKey)

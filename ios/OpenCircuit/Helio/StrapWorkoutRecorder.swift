@@ -183,6 +183,9 @@ final class StrapWorkoutRecorder {
     private(set) var liveZoneBreakdown = WorkoutZoneBreakdown()
     private(set) var hrSampleCount = 0
     private(set) var ledger: WorkoutActivityLedger?
+    /// When the GPS distance last moved, for the Live Activity's current pace (#283). Reset at every
+    /// pause and resume: a pace never spans a pause.
+    @ObservationIgnored private var paceTracker = WorkoutPaceTracker()
     /// Beat-to-beat (RR) intervals the strap sent during this workout. A diagnostic: whether the Helio
     /// sends them at all is unknown (ZEPP_PROTOCOL.md §7.1), and an on-demand HRV reading needs them.
     private(set) var rrIntervalCount = 0
@@ -193,10 +196,18 @@ final class StrapWorkoutRecorder {
     private(set) var vo2MaxOutcome: VO2MaxEstimate.Outcome?
     /// What became of the estimate's Apple Health write: nil while it is in flight.
     private(set) var vo2MaxHealthStatus: VO2MaxHealthWriter.Status?
-    /// A workout the previous process was running when it died, offered back (save or discard).
+    /// A workout the previous process was running when it died, offered back (save or discard). What
+    /// the alert shows: nil once it is answered or put off.
     private(set) var recoverable: RecoveredStrapWorkout?
-    /// Where `recoverable` came from, so Save/Discard clear exactly that journal.
-    @ObservationIgnored private var recoverableSlot: RecoverySlot?
+    /// The offer Save and Discard answer, with where it came from so they clear exactly that journal.
+    /// It outlives "Not now"'s hide (#296): SwiftUI may run the alert's `isPresented` setter (which
+    /// puts it off) before the Save button's action, and the user's Save must still find it. Taken
+    /// (set to nil) by the first Save or Discard, so a later put-off is a no-op for that workout.
+    @ObservationIgnored private var offer: RecoveryOffer?
+    private struct RecoveryOffer {
+        let workout: RecoveredStrapWorkout
+        let slot: RecoverySlot
+    }
     private enum RecoverySlot: Equatable { case running, parked(Int) }
 
     var isRecording: Bool { state == .active }
@@ -242,6 +253,8 @@ final class StrapWorkoutRecorder {
     @ObservationIgnored private let indoorKeepAlive: () -> Bool
     @ObservationIgnored private let orphanStop: StrapWorkoutOrphanStop
     @ObservationIgnored private let vo2: (any StrapVO2MaxProviding)?
+    /// Workouts deleted from the history screen (#293): never offered back after a kill.
+    @ObservationIgnored private let tombstones: WorkoutTombstones
 
     // MARK: Session state
 
@@ -269,6 +282,7 @@ final class StrapWorkoutRecorder {
          },
          orphanStop: StrapWorkoutOrphanStop = StrapWorkoutOrphanStop(),
          vo2: (any StrapVO2MaxProviding)? = nil,
+         tombstones: WorkoutTombstones = WorkoutTombstones(),
          clock: @escaping () -> Date = Date.init,
          autoTick: Bool = true,
          managesIdleTimer: Bool = true) {
@@ -282,6 +296,7 @@ final class StrapWorkoutRecorder {
         self.indoorKeepAlive = indoorKeepAlive
         self.orphanStop = orphanStop
         self.vo2 = vo2
+        self.tombstones = tombstones
         self.clock = clock
         self.autoTick = autoTick
         self.managesIdleTimer = managesIdleTimer
@@ -327,13 +342,16 @@ final class StrapWorkoutRecorder {
         currentHR = nil
         currentHRAt = nil
         liveZoneBreakdown = WorkoutZoneBreakdown()
+        paceTracker.reset()
         hrSampleCount = 0
         tickCount = 0
         vo2MaxOutcome = nil
         vo2MaxHealthStatus = nil
         rrIntervalCount = 0
         // Review-238 N1: an interrupted workout still waiting for the person's answer ("Not now") is set
-        // aside, never deleted; the next launch offers it again.
+        // aside, never deleted; the next launch offers it again. A put-off offer's slot no longer points
+        // at it once it is parked, so nothing may answer it in this process any more.
+        if recoverable == nil { offer = nil }
         if journal.loadJournal() != nil { journal.parkRunning() } else { journal.clearRunning() }
         persistJournal(now: now)
         attach(session, now: now)
@@ -356,6 +374,7 @@ final class StrapWorkoutRecorder {
         let now = clock()
         ledger.pause(at: now)
         self.ledger = ledger
+        paceTracker.reset()
         location.setPaused(true)
         refresh(now: now)
         persistJournal(now: now)
@@ -368,6 +387,7 @@ final class StrapWorkoutRecorder {
         let now = clock()
         ledger.resume(at: now)
         self.ledger = ledger
+        paceTracker.reset()
         location.setPaused(false)
         refresh(now: now)
         persistJournal(now: now)
@@ -405,6 +425,7 @@ final class StrapWorkoutRecorder {
     private func refresh(now: Date) {
         guard let ledger else { return }
         activeSeconds = ledger.activeSeconds(until: now)
+        if !ledger.isPaused, selectedSport.isOutdoor { paceTracker.observe(distanceMeters: location.distanceMeters, at: now) }
         liveZoneBreakdown = StrapWorkoutSummaryBuilder.zones(samples, ledger: ledger, end: now, maxHR: maxHR)
     }
 
@@ -610,11 +631,16 @@ final class StrapWorkoutRecorder {
     func resolveOrphan(now: Date? = nil) {
         guard state == .idle, recoverable == nil else { return }
         let now = now ?? clock()
+        var found: RecoveryOffer?
+        defer {
+            offer = found
+            recoverable = found?.workout
+        }
         if let running = journal.loadJournal() {
             // Review-238 SF2: whatever the answer (Save, Discard, Not now, or a refusal below), the dead
             // process's stream is owed one `04 00`, sent at the strap's next authenticated `ready`.
             orphanStop.owed = true
-            switch StrapWorkoutRecovery.decide(journal: running, samples: journal.loadSamples(), now: now) {
+            switch tombstones.filter(StrapWorkoutRecovery.decide(journal: running, samples: journal.loadSamples(), now: now)) {
             case .nothingToRecover:
                 break
             case .discard(let refusal):
@@ -622,19 +648,18 @@ final class StrapWorkoutRecorder {
                 journal.clearRunning()
             case .offer(let recovered):
                 helioLog.notice("helio: offering an interrupted workout back")
-                recoverable = recovered
-                recoverableSlot = .running
+                found = RecoveryOffer(workout: recovered, slot: .running)
             }
         }
-        if recoverable == nil {
-            // A workout set aside by a new one's start after "Not now"; one with no defensible span is dropped.
+        if found == nil {
+            // A workout set aside by a new one's start after "Not now"; one with no defensible span, or one
+            // the user has since deleted from the history (#293), is dropped.
             var parked = journal.loadParked()
             let before = parked.count
             while let first = parked.first {
-                if case .offer(let recovered) = StrapWorkoutRecovery.decide(journal: first.journal, samples: first.samples, now: now) {
+                if case .offer(let recovered) = tombstones.filter(StrapWorkoutRecovery.decide(journal: first.journal, samples: first.samples, now: now)) {
                     helioLog.notice("helio: offering a postponed interrupted workout back")
-                    recoverable = recovered
-                    recoverableSlot = .parked(0)
+                    found = RecoveryOffer(workout: recovered, slot: .parked(0))
                     break
                 }
                 parked.removeFirst()
@@ -644,46 +669,65 @@ final class StrapWorkoutRecorder {
         if orphanStop.owed, let session = source(), session.ready { session.sendOwedOrphanStop() }
     }
 
-    private func clearRecoverableSlot() {
-        switch recoverableSlot {
-        case .running?: journal.clearRunning()
-        case .parked(let index)?:
+    /// Take the offer on screen (or put off by the alert's dismissal a moment ago) as answered.
+    private func takeOffer() -> RecoveryOffer? {
+        let taken = offer
+        offer = nil
+        recoverable = nil
+        return taken
+    }
+
+    private func clear(_ slot: RecoverySlot) {
+        switch slot {
+        case .running: journal.clearRunning()
+        case .parked(let index):
             var parked = journal.loadParked()
             if parked.indices.contains(index) { parked.remove(at: index) }
             journal.saveParked(parked)
-        case nil: break
         }
-        recoverableSlot = nil
     }
 
-    /// Save the interrupted workout: one `HKWorkout` over the recovered span, with its readings. Its
+    /// Save's synchronous half (#296), run from the button itself: takes the offer, queues its readings
+    /// for `LocalStore` and drops its journal BEFORE the Health write (a kill mid-write can never offer
+    /// or write it twice), and returns the write for `writeRecovered`. nil once it is answered. Its
     /// route lived in memory and is gone, so it is saved without one (as the ring's recovery is).
-    @discardableResult
-    func saveRecovered() async -> Bool {
-        guard let recovered = recoverable else { return false }
-        recoverable = nil
+    func takeRecoveredForSave() -> StrapWorkoutWrite? {
+        guard let offer = takeOffer() else { return nil }
+        let recovered = offer.workout
         let timeline = SyncDeviceID(rawValue: recovered.timelineRaw)
         let summary = StrapWorkoutSummaryBuilder.summarize(
             sport: recovered.sport, ledger: recovered.ledger, samples: recovered.samples, end: recovered.end,
             distanceMeters: nil, hasRoute: false, profile: profile())
         let counted = StrapWorkoutSummaryBuilder.activeSamples(recovered.samples, ledger: recovered.ledger, end: recovered.end)
         enqueueLanding(counted, timeline: timeline)
-        clearRecoverableSlot()   // before the write: a second offer can never write it twice
-        let saved = await health.save(StrapWorkoutWrite(summary: summary, samples: counted, route: [], timeline: timeline))
+        clear(offer.slot)   // before the write: a second offer can never write it twice
+        return StrapWorkoutWrite(summary: summary, samples: counted, route: [], timeline: timeline)
+    }
+
+    /// Save's async half: one `HKWorkout` over the recovered span, with its readings.
+    func writeRecovered(_ write: StrapWorkoutWrite) async -> Bool {
+        let saved = await health.save(write)
         helioLog.notice("helio: interrupted workout saved to Health \(saved, privacy: .public)")
         landPendingHeartRate()
         return saved
     }
 
-    func discardRecovered() {
-        recoverable = nil
-        clearRecoverableSlot()
+    /// Save the interrupted workout, both halves.
+    @discardableResult
+    func saveRecovered() async -> Bool {
+        guard let write = takeRecoveredForSave() else { return false }
+        return await writeRecovered(write)
     }
 
-    /// "Not now": asked again at the next launch.
+    func discardRecovered() {
+        guard let offer = takeOffer() else { return }
+        clear(offer.slot)
+    }
+
+    /// "Not now", and any dismissal of the alert: hidden now, asked again at the next launch. The offer
+    /// stays answerable, so a Save or Discard of the same alert that SwiftUI runs after this still wins.
     func postponeRecovered() {
         recoverable = nil
-        recoverableSlot = nil
     }
 
     // MARK: Heart rate into LocalStore
@@ -726,10 +770,51 @@ final class StrapWorkoutRecorder {
         } ?? 0
         let active = ledger.activeSeconds(until: now)
         // The Lock Screen clock shows running time: counted up from `now − active` while running,
-        // standing still while paused.
-        await liveActivity.update(WorkoutActivityAttributes.ContentState(
-            elapsedSeconds: active, activeKcal: Int(kcal.rounded()),
-            bpm: isPaused ? nil : currentHR, hrIsStale: isPaused || currentHRIsStale,
-            clockStart: now.addingTimeInterval(-active), pausedElapsed: isPaused ? active : nil))
+        // standing still while paused. Distance / pace / zone are the same figures the screen shows
+        // (#283), built by the shared constructor the ring uses.
+        let distance = selectedSport.isOutdoor && !location.route.isEmpty ? location.distanceMeters : nil
+        await liveActivity.update(WorkoutLiveActivityController.state(
+            activeSeconds: active, activeKcal: Int(kcal.rounded()),
+            bpm: currentHR, hrIsStale: currentHRIsStale,
+            paused: isPaused, everPaused: true,
+            distanceMeters: distance,
+            currentPaceSecPerKm: paceTracker.currentSecPerKm(now: now),
+            avgPaceSecPerKm: WorkoutPace.averageSecPerKm(distanceMeters: distance, activeSeconds: active),
+            hrZone: WorkoutPace.liveZone(bpm: currentHR, isStale: currentHRIsStale, maxHR: maxHR),
+            now: now))
     }
+}
+
+/// The strap's "Interrupted workout" alert, button by button (#296). SwiftUI runs a button's action and
+/// the alert's `isPresented` setter in either order, so each entry point here is synchronous and the
+/// answer can't depend on that order: Save takes the workout before its Task is even created, and a
+/// dismissal only hides the alert. The ring's alert (`ContentView.saveRecoverableWorkout`) captures its
+/// workout synchronously the same way.
+@MainActor
+struct StrapRecoveryAlert {
+    let recorder: StrapWorkoutRecorder
+    /// After a Save that reached Health.
+    let onSaved: @MainActor () -> Void
+
+    var isPresented: Bool { recorder.recoverable != nil }
+
+    /// The `isPresented` setter.
+    func setPresented(_ presented: Bool) {
+        if !presented { recorder.postponeRecovered() }
+    }
+
+    /// The Health write runs in the returned Task (nil when the workout was already answered).
+    @discardableResult
+    func save() -> Task<Void, Never>? {
+        guard let write = recorder.takeRecoveredForSave() else { return nil }
+        let recorder = recorder
+        let onSaved = onSaved
+        return Task { @MainActor in
+            if await recorder.writeRecovered(write) { onSaved() }
+        }
+    }
+
+    func discard() { recorder.discardRecovered() }
+
+    func notNow() { recorder.postponeRecovered() }
 }

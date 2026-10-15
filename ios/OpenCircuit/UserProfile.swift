@@ -24,6 +24,11 @@ private enum BodyUnit: String, CaseIterable {
 struct UserProfileSettingsView: View {
     @AppStorage("userProfile.age") private var age = 35
     @AppStorage("userProfile.weightKg") private var weightKg = 70.0
+    /// When the user last edited the weight (#284), epoch seconds; 0 = never stamped. Lets a newer
+    /// Apple Health body mass take over the calorie math without ever overwriting this field.
+    @AppStorage(WeightResolver.Keys.manualSetAt) private var weightSetAtEpoch = 0.0
+    @AppStorage(WeightResolver.Keys.healthKg) private var healthWeightKg = 0.0
+    @AppStorage(WeightResolver.Keys.healthAt) private var healthWeightAtEpoch = 0.0
     @AppStorage("userProfile.heightCm") private var heightCm = 170.0
     @AppStorage("userProfile.sex") private var sexRaw = BiologicalSex.male.rawValue
 
@@ -207,6 +212,7 @@ struct UserProfileSettingsView: View {
                             Text("lb").foregroundStyle(.secondary)
                         }
                     }
+                    .onChange(of: weightKg) { _, _ in weightSetAtEpoch = Date().timeIntervalSince1970 }
                     // Seed the lb buffer from the current `weightKg` when the imperial field is
                     // (or becomes) visible — on first appear AND when the user flips the unit
                     // picker to imperial — mirroring the height ft/in seeding below (#151).
@@ -214,6 +220,9 @@ struct UserProfileSettingsView: View {
                     .onChange(of: bodyUnitRaw) { _, newRaw in
                         if newRaw == BodyUnit.imperial.rawValue { seedWeightInput() }
                     }
+                }
+                if let note = healthWeightNote {
+                    Text(note).font(.caption).foregroundStyle(.secondary)
                 }
                 LabeledContent("Height") {
                     HStack(spacing: 4) {
@@ -467,7 +476,7 @@ struct UserProfileSettingsView: View {
                 Stepper(value: $weekendSleepMin, in: 240...600, step: 15) {
                     LabeledContent("Weekend sleep", value: formatGoalSleep(weekendSleepMin))
                 }
-                Text("Progress rings on the dashboard show today's goal vs. actual. Elevated-HR minutes are an estimate, not detected workout duration: they count time at least 40% of the way from your resting heart rate up to your age-estimated maximum, so a naturally fast or slow resting pulse doesn't shift the ring. On a day with too little data to read your resting pulse, the bar falls back to half your age-estimated maximum. Active calories use those same qualifying periods with steps as the fallback.")
+                Text("Progress rings on the dashboard show today's goal vs. actual. Elevated-HR minutes are an estimate, not detected workout duration: they count time at or above half your age-estimated maximum heart rate while you are moving (steps around it, or a recorded workout), so a raised pulse while sitting still doesn't count. Active calories use those same periods, count only energy above resting, and fall back to steps. Record non-walking exercise (cycling, weights, rowing) as a workout so it is counted in full.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -633,6 +642,16 @@ struct UserProfileSettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
+            Section("Shortcuts") {
+                NavigationLink {
+                    ShortcutsGuideView()
+                } label: {
+                    Label("Shortcuts guide", systemImage: "square.stack.3d.up")
+                }
+                Text("Vibrate your wearable or set its wake alarm from an automation.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
             // MARK: Data export (#80)
             Section("Data export") {
                 NavigationLink {
@@ -655,6 +674,9 @@ struct UserProfileSettingsView: View {
                 }
                 Link(destination: URL(string: Self.privacyPolicyURL)!) {
                     Label("Privacy Policy", systemImage: "hand.raised")
+                }
+                Link(destination: URL(string: Self.supportDevelopmentURL)!) {
+                    Label("Buy Me a Coffee", systemImage: "cup.and.saucer.fill")
                 }
                 // The same constant as onboarding's last page (#255), so the two can't drift apart.
                 Text(DeviceCopy.disclaimer + " Your data stays on your device and is written only to "
@@ -781,6 +803,9 @@ struct UserProfileSettingsView: View {
     /// Privacy policy (required for HealthKit). GitHub renders the markdown as a reachable page;
     /// swap for a GitHub Pages URL when one is set up (#101).
     private static let privacyPolicyURL = "https://github.com/perezjuanj/OpenCircuit/blob/master/docs/PRIVACY.md"
+    /// OpenCircuit is free with no ads or subscription (#support). Same destination as the Profile
+    /// tab footer's link (`ContentView.brandFooter`) — keep both in sync if this ever changes.
+    private static let supportDevelopmentURL = "https://buymeacoffee.com/standardsoftware"
     private var appVersion: String {
         let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
         let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "—"
@@ -798,6 +823,17 @@ struct UserProfileSettingsView: View {
     private static let lbPerKg = 2.2046226218
     private static let cmPerIn = 2.54
 
+    /// Says so when a newer Apple Health body mass is what the calorie math uses (#284); nil otherwise.
+    private var healthWeightNote: String? {
+        let r = WeightResolver.resolve(manualKg: weightKg, manualSetAtEpoch: weightSetAtEpoch,
+                                       healthKg: healthWeightKg, healthAtEpoch: healthWeightAtEpoch)
+        guard r.source == .appleHealth, let date = r.date else { return nil }
+        let shown = bodyUnit == .metric
+            ? String(format: "%.1f kg", r.kg)
+            : "\(Int((r.kg * Self.lbPerKg).rounded())) lb"
+        return "Calories use \(shown) from Apple Health (\(date.formatted(date: .abbreviated, time: .omitted))), newer than this entry."
+    }
+
     /// Seed the local lb editing field from the stored weight. Done on appear (and when the
     /// unit picker switches to imperial) so the text field holds its own state and typing
     /// isn't reset by the shared `weightKg` store — see `weightLbInput` above (#151).
@@ -807,6 +843,9 @@ struct UserProfileSettingsView: View {
 
     /// Write the local lb field back to `weightKg`, clamping to non-negative.
     private func commitWeight() {
+        // Seeding the buffer on appear also lands here; an unchanged value is not an edit, and must
+        // not stamp "last set" (#284).
+        guard Int((weightKg * Self.lbPerKg).rounded()) != max(weightLbInput, 0) else { return }
         weightKg = Double(max(weightLbInput, 0)) / Self.lbPerKg
     }
 
@@ -821,11 +860,20 @@ struct UserProfileSettingsView: View {
         heightInchesInput = total % 12
     }
 
+    /// The cm to store for the typed ft/in, or nil when it equals the stored height in whole inches.
+    /// Seeding the ft/in buffers on appear also lands in `commitHeight()`; an unchanged value is not
+    /// an edit and must not write the key (it would clear the "default height" flag).
+    static func heightCmToWrite(feet: Int, inches: Int, currentCm: Double) -> Double? {
+        let total = max(feet, 0) * 12 + min(max(inches, 0), 11)
+        guard total != Int((currentCm / cmPerIn).rounded()) else { return nil }
+        return Double(total) * cmPerIn
+    }
+
     /// Write the local ft/in fields back to `heightCm`, clamping inches to 0...11.
     private func commitHeight() {
-        let feet = max(heightFeetInput, 0)
-        let inches = min(max(heightInchesInput, 0), 11)
-        heightCm = Double(feet * 12 + inches) * Self.cmPerIn
+        guard let cm = Self.heightCmToWrite(feet: heightFeetInput, inches: heightInchesInput,
+                                            currentCm: heightCm) else { return }
+        heightCm = cm
     }
 
     // MARK: Sleep-schedule bindings (minutes-since-midnight <-> Date for DatePicker)

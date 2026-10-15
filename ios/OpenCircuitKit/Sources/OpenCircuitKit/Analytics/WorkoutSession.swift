@@ -27,6 +27,7 @@ import Foundation
 /// CoreLocation; indoor types (strength, yoga, other) do not.
 public enum WorkoutSportType: String, Codable, CaseIterable, Sendable {
     case walkingOutdoor
+    case walkingIndoor
     case runningOutdoor
     case runningIndoor
     case cyclingOutdoor
@@ -40,6 +41,7 @@ public enum WorkoutSportType: String, Codable, CaseIterable, Sendable {
     public var displayName: String {
         switch self {
         case .walkingOutdoor: return "Outdoor Walking"
+        case .walkingIndoor:  return "Indoor Walking"
         case .runningOutdoor: return "Outdoor Running"
         case .runningIndoor:  return "Indoor Running"
         case .cyclingOutdoor: return "Outdoor Cycling"
@@ -57,13 +59,14 @@ public enum WorkoutSportType: String, Codable, CaseIterable, Sendable {
     public var isOutdoor: Bool {
         switch self {
         case .walkingOutdoor, .runningOutdoor, .cyclingOutdoor, .hiking: return true
-        case .runningIndoor, .cyclingIndoor, .rowing, .strengthTraining, .yoga, .other: return false
+        case .walkingIndoor, .runningIndoor, .cyclingIndoor, .rowing, .strengthTraining, .yoga, .other: return false
         }
     }
 
     public var systemImageName: String {
         switch self {
         case .walkingOutdoor:    return "figure.walk"
+        case .walkingIndoor:     return "figure.walk.treadmill"
         case .runningOutdoor:    return "figure.run"
         case .runningIndoor:     return "figure.run.treadmill"
         case .cyclingOutdoor:    return "bicycle"
@@ -83,6 +86,7 @@ public enum WorkoutSportType: String, Codable, CaseIterable, Sendable {
         switch self {
         case .runningOutdoor:   return SportType.outdoorRunning.rawValue   // 0x01
         case .walkingOutdoor:   return SportType.outdoorWalking.rawValue   // 0x02
+        case .walkingIndoor:    return SportType.outdoorWalking.rawValue   // 0x02 — ring has no indoor-walk code
         case .runningIndoor:    return SportType.indoorRunning.rawValue    // 0x03
         case .cyclingOutdoor:   return SportType.outdoorCycling.rawValue   // 0x04
         case .cyclingIndoor:    return SportType.indoorCycling.rawValue    // 0x05
@@ -522,8 +526,20 @@ public enum WorkoutBufferedSportFill {
     public struct Fill: Equatable, Sendable {
         public let hrSamples: [HRSample]
         public let steps: Int
+        /// Per-record step counts with each record's end time, so a caller that needs to exclude
+        /// steps for part of the window (a workout pause, #283 B2) can filter the same way it
+        /// already filters `hrSamples` — `steps` alone is a pre-summed scalar and can't be split.
+        /// Populated for every record `steps` counts, in the same order; filtering this and summing
+        /// `.steps` must always equal the unfiltered total.
+        public let stepRecords: [StepRecord]
         /// Cursors consumed (HR or steps), so a caller merging repeatedly never adds one twice.
         public let cursors: Set<UInt32>
+    }
+
+    /// One buffered record's step count and the end of its 10 s interval (#283 B2).
+    public struct StepRecord: Equatable, Sendable {
+        public let end: Date
+        public let steps: Int
     }
 
     public static func fill(captured: [HRSample],
@@ -533,6 +549,7 @@ public enum WorkoutBufferedSportFill {
                             liveFrameCursors: Set<UInt32> = []) -> Fill {
         var hr: [HRSample] = []
         var steps = 0
+        var stepRecords: [StepRecord] = []
         var used: Set<UInt32> = []
         let interval = HistoricalSportFrame.intervalSeconds
         for record in buffered where !alreadyMerged.contains(record.cursor) {
@@ -548,8 +565,10 @@ public enum WorkoutBufferedSportFill {
             if captured.contains(where: { $0.end >= lo && $0.end <= hi }) { continue }
             if let bpm = record.heartRate { hr.append(HRSample(bpm: bpm, start: start, end: end)) }
             steps += record.steps
+            stepRecords.append(StepRecord(end: end, steps: record.steps))
             used.insert(record.cursor)
         }
-        return Fill(hrSamples: hr.sorted { $0.start < $1.start }, steps: steps, cursors: used)
+        return Fill(hrSamples: hr.sorted { $0.start < $1.start }, steps: steps,
+                   stepRecords: stepRecords, cursors: used)
     }
 }
