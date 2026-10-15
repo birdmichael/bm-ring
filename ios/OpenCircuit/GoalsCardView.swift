@@ -12,7 +12,29 @@ import SwiftUI
 import SwiftData
 import OpenCircuitKit
 
+/// The card as placed in the app: it follows the calendar day (#297), re-creating its body (and so
+/// its day-bound queries) when the day changes.
 struct GoalsCardView: View {
+    var body: some View {
+        CurrentDayView("goals") { GoalsCardBody(dayStart: $0) }
+    }
+}
+
+/// Today's heart-rate samples: that day only, so the query can never span two days (#297).
+enum GoalsCardQueries {
+    static func heartRate(dayStart: Date, calendar: Calendar = .current) -> FetchDescriptor<StoredSample> {
+        let hrKind = MetricKind.heartRate.rawValue
+        let dayEnd = DayRollover.nextDayStart(after: dayStart, calendar: calendar)
+        return FetchDescriptor<StoredSample>(
+            predicate: #Predicate { $0.kindRaw == hrKind && $0.start >= dayStart && $0.start < dayEnd && $0.value > 0 },
+            sortBy: [SortDescriptor(\.start, order: .forward)])
+    }
+}
+
+private struct GoalsCardBody: View {
+
+    /// The day this instance was built for; `CurrentDayView` re-creates it when the day changes.
+    private let dayStart: Date
 
     // MARK: Goal settings (shared with UserProfileSettingsView / GoalDefaults)
     @AppStorage(GoalDefaults.workdaySteps)    private var workdaySteps    = GoalDefaults.defaultWorkdaySteps
@@ -25,6 +47,14 @@ struct GoalsCardView: View {
     // Profile (for maxHR → exercise threshold, and the step/distance active-calorie estimate)
     @AppStorage("userProfile.age") private var age = 35
     @AppStorage("userProfile.weightKg") private var weightKg = 70.0
+    // #284: manual-entry date + cached latest Apple Health body mass; the newer one feeds the math.
+    @AppStorage(WeightResolver.Keys.manualSetAt) private var weightSetAtEpoch = 0.0
+    @AppStorage(WeightResolver.Keys.healthKg) private var healthWeightKg = 0.0
+    @AppStorage(WeightResolver.Keys.healthAt) private var healthWeightAtEpoch = 0.0
+    private var effectiveWeightKg: Double {
+        WeightResolver.resolve(manualKg: weightKg, manualSetAtEpoch: weightSetAtEpoch,
+                               healthKg: healthWeightKg, healthAtEpoch: healthWeightAtEpoch).kg
+    }
     @AppStorage("userProfile.heightCm") private var heightCm = 170.0
     @AppStorage("userProfile.sex") private var sexRaw = BiologicalSex.male.rawValue
 
@@ -44,10 +74,9 @@ struct GoalsCardView: View {
     /// have to show the same number.
     @Query private var recentStepSamples: [StoredStepSample]
 
-    init() {
-        let dayStart = Calendar.current.startOfDay(for: Date())
+    init(dayStart: Date) {
+        self.dayStart = dayStart
         let stepsFrom = dayStart.addingTimeInterval(-86_400)
-        let hrKind = MetricKind.heartRate.rawValue
 
         _recentStepSamples = Query(FetchDescriptor<StoredStepSample>(
             predicate: #Predicate { $0.start >= stepsFrom },
@@ -63,10 +92,8 @@ struct GoalsCardView: View {
 
         // Count ALL of today's HR (no upper-hour cap) so this card matches CaloriesCardView and
         // doesn't lag up to 59 min behind it — e.g. right after an on-demand measurement. The
-        // stable `dayStart` lower bound already keeps the @Query descriptor stable.
-        _todayHR = Query(FetchDescriptor<StoredSample>(
-            predicate: #Predicate { $0.kindRaw == hrKind && $0.start >= dayStart && $0.value > 0 },
-            sortBy: [SortDescriptor(\.start, order: .forward)]))
+        // stable `dayStart` bounds keep the @Query descriptor stable.
+        _todayHR = Query(GoalsCardQueries.heartRate(dayStart: dayStart))
 
         var sleepDesc = FetchDescriptor<StoredSleepSummary>(
             sortBy: [SortDescriptor(\.night, order: .reverse)])
@@ -93,9 +120,11 @@ struct GoalsCardView: View {
     /// so they re-run on new data (HR count grows, steps, profile, or last night) and never on an
     /// unrelated re-render.
     private var goalsInputsKey: String {
-        "\(todayHR.count)|\(currentSteps)|\(recentStepSamples.count)|\(age)|\(weightKg)|"
-        + "\(heightCm)|\(sexRaw)|\(latestSleep.first?.night.timeIntervalSince1970 ?? 0)"
+        "\(todayHR.count)|\(currentSteps)|\(recentStepSamples.count)|\(age)|\(effectiveWeightKg)|"
+        + "\(heightCm)|\(sexRaw)|\(latestSleep.first?.night.timeIntervalSince1970 ?? 0)|\(workoutCreditsRevision)"
     }
+    /// Bumped when a deleted workout's credited span is undone (#293), so the goals recompute.
+    @AppStorage(HealthKitWriter.workoutCreditsRevisionKey) private var workoutCreditsRevision = 0
 
     // MARK: Computed values
 
@@ -106,7 +135,7 @@ struct GoalsCardView: View {
     private var currentSteps: Int { todayDaily.first?.steps ?? 0 }
 
     private var profile: UserProfile {
-        UserProfile(age: age, weightKg: max(weightKg, 1), heightCm: max(heightCm, 1),
+        UserProfile(age: age, weightKg: max(effectiveWeightKg, 1), heightCm: max(heightCm, 1),
                     sex: BiologicalSex(rawValue: sexRaw) ?? .male)
     }
 
@@ -229,7 +258,9 @@ struct GoalsCardView: View {
             let stepWindows = recentStepSamples.map {
                 StepWindow(start: $0.start, end: $0.end, delta: $0.delta)
             }
-            let dayStart = Calendar.current.startOfDay(for: Date())
+            // #281 motion gate (off by default): the ring's own activity sessions.
+            let activityIntervals = RingActivityEventLedger.load().corroboratingIntervals(now: Date())
+            let creditedWorkoutIntervals = HealthKitWriter.workoutCreditedSpans(day: dayStart)
             let result = await Task.detached { () -> Calories.DailyEstimate in
                 Calories.dailyEstimate(
                     hrSamples: samples,
@@ -237,7 +268,9 @@ struct GoalsCardView: View {
                     profile: profile,
                     sleepWindow: sleepWindow,
                     stepWindows: stepWindows,
-                    dayStart: dayStart
+                    dayStart: dayStart,
+                    activityIntervals: activityIntervals,
+                    creditedWorkoutIntervals: creditedWorkoutIntervals
                 )
             }.value
             cachedActiveKcal = result.activeKcal

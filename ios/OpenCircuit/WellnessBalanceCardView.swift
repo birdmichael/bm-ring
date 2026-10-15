@@ -16,7 +16,24 @@ import SwiftUI
 import SwiftData
 import OpenCircuitKit
 
+/// The card as placed in the app: it follows the calendar day (#297), re-creating its body (and so
+/// its day-bound queries) when the day changes.
 struct WellnessBalanceCardView: View {
+    var onReport: ((ReadinessReport) -> Void)?
+
+    init(onReport: ((ReadinessReport) -> Void)? = nil) {
+        self.onReport = onReport
+    }
+
+    var body: some View {
+        CurrentDayView("wellness") { WellnessBalanceCardBody(dayStart: $0, onReport: onReport) }
+    }
+}
+
+private struct WellnessBalanceCardBody: View {
+
+    /// The day this instance was built for; `CurrentDayView` re-creates it when the day changes.
+    private let dayStart: Date
 
     // Goal + profile settings (shared with GoalsCardView / GoalDefaults) for the Activity Score.
     @AppStorage(GoalDefaults.workdaySteps)    private var workdaySteps   = GoalDefaults.defaultWorkdaySteps
@@ -25,6 +42,14 @@ struct WellnessBalanceCardView: View {
     @AppStorage(GoalDefaults.activityMinutes) private var actMinGoal     = GoalDefaults.defaultActivityMinutes
     @AppStorage("userProfile.age") private var age = 35
     @AppStorage("userProfile.weightKg") private var weightKg = 70.0
+    // #284: manual-entry date + cached latest Apple Health body mass; the newer one feeds the math.
+    @AppStorage(WeightResolver.Keys.manualSetAt) private var weightSetAtEpoch = 0.0
+    @AppStorage(WeightResolver.Keys.healthKg) private var healthWeightKg = 0.0
+    @AppStorage(WeightResolver.Keys.healthAt) private var healthWeightAtEpoch = 0.0
+    private var effectiveWeightKg: Double {
+        WeightResolver.resolve(manualKg: weightKg, manualSetAtEpoch: weightSetAtEpoch,
+                               healthKg: healthWeightKg, healthAtEpoch: healthWeightAtEpoch).kg
+    }
     @AppStorage("userProfile.heightCm") private var heightCm = 170.0
     @AppStorage("userProfile.sex") private var sexRaw = BiologicalSex.male.rawValue
 
@@ -42,18 +67,15 @@ struct WellnessBalanceCardView: View {
     @ScaledMetric(relativeTo: .largeTitle) private var ringSize: CGFloat = 132
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
-    init(onReport: ((ReadinessReport) -> Void)? = nil) {
+    init(dayStart: Date, onReport: ((ReadinessReport) -> Void)?) {
         self.onReport = onReport
-        let dayStart = Calendar.current.startOfDay(for: Date())
+        self.dayStart = dayStart
         let stepsFrom = dayStart.addingTimeInterval(-86_400)
-        let hrKind = MetricKind.heartRate.rawValue
         _recentStepSamples = Query(FetchDescriptor<StoredStepSample>(
             predicate: #Predicate { $0.start >= stepsFrom },
             sortBy: [SortDescriptor(\.start, order: .forward)]))
         _todayDaily = Query(filter: #Predicate<StoredDaily> { $0.day == dayStart }, sort: \.day)
-        _todayHR = Query(FetchDescriptor<StoredSample>(
-            predicate: #Predicate { $0.kindRaw == hrKind && $0.start >= dayStart && $0.value > 0 },
-            sortBy: [SortDescriptor(\.start, order: .forward)]))
+        _todayHR = Query(GoalsCardQueries.heartRate(dayStart: dayStart))
         var sleepDesc = FetchDescriptor<StoredSleepSummary>(sortBy: [SortDescriptor(\.night, order: .reverse)])
         sleepDesc.fetchLimit = 1
         _latestSleep = Query(sleepDesc)
@@ -66,7 +88,7 @@ struct WellnessBalanceCardView: View {
     private var stepsGoal: Int { GoalDefaults.isWeekend() ? weekendSteps : workdaySteps }
     private var currentSteps: Int { todayDaily.first?.steps ?? 0 }
     private var profile: UserProfile {
-        UserProfile(age: age, weightKg: max(weightKg, 1), heightCm: max(heightCm, 1),
+        UserProfile(age: age, weightKg: max(effectiveWeightKg, 1), heightCm: max(heightCm, 1),
                     sex: BiologicalSex(rawValue: sexRaw) ?? .male)
     }
 
@@ -122,11 +144,13 @@ struct WellnessBalanceCardView: View {
 
     /// Recompute identity — changes only when an input to readiness changes.
     private var inputsKey: String {
-        "\(todayHR.count)|\(currentSteps)|\(recentStepSamples.count)|\(age)|\(weightKg)|\(heightCm)|\(sexRaw)|"
+        "\(todayHR.count)|\(currentSteps)|\(recentStepSamples.count)|\(age)|\(effectiveWeightKg)|\(heightCm)|\(sexRaw)|"
         + "\(latestSleep.first?.night.timeIntervalSince1970 ?? 0)|\(latestSleep.first?.sleepScore ?? 0)|"
         + "\(latestSleep.first?.stressScore ?? 0)|\(sleepCredited ? 1 : 0)|"
-        + "\(stepsGoal)|\(Int(actMinGoal))|\(Int(activeKcalGoal))"
+        + "\(stepsGoal)|\(Int(actMinGoal))|\(Int(activeKcalGoal))|\(workoutCreditsRevision)"
     }
+    /// Bumped when a deleted workout's credited span is undone (#293), so readiness recomputes.
+    @AppStorage(HealthKitWriter.workoutCreditsRevisionKey) private var workoutCreditsRevision = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -211,7 +235,9 @@ struct WellnessBalanceCardView: View {
             let stepWindows = recentStepSamples.map {
                 StepWindow(start: $0.start, end: $0.end, delta: $0.delta)
             }
-            let dayStart = Calendar.current.startOfDay(for: Date())
+            // #281 motion gate (off by default): the ring's own activity sessions.
+            let activityIntervals = RingActivityEventLedger.load().corroboratingIntervals(now: Date())
+            let creditedWorkoutIntervals = HealthKitWriter.workoutCreditedSpans(day: dayStart)
 
             let activity = await Task.detached { () -> ActivityScore.Result in
                 let estimate = Calories.dailyEstimate(
@@ -220,7 +246,9 @@ struct WellnessBalanceCardView: View {
                     profile: profile,
                     sleepWindow: sleepWindow,
                     stepWindows: stepWindows,
-                    dayStart: dayStart
+                    dayStart: dayStart,
+                    activityIntervals: activityIntervals,
+                    creditedWorkoutIntervals: creditedWorkoutIntervals
                 )
                 return ActivityScore.score(.init(
                     steps: steps, stepGoal: stepGoal,

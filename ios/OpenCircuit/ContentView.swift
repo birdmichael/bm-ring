@@ -258,7 +258,8 @@ struct ContentView: View {
                     Task { await loadTrends(.syncFinished) }
                 }))
             // The strap's workout (#227): its sheet, the interrupted-workout offer, the landing pass.
-            .modifier(StrapWorkoutHooks(recorder: strapWorkouts, session: helioSession, show: $showStrapWorkout,
+            .modifier(StrapWorkoutHooks(recorder: strapWorkouts, session: helioSession, ringManager: workoutManager,
+                                        show: $showStrapWorkout,
                                         onWorkoutsChanged: { workoutHistoryToken += 1 }))
             // Feed / reset the liveline live-vitals buffer as on-demand readings arrive.
             .onChange(of: session?.liveHR) { _, hr in
@@ -687,7 +688,8 @@ struct ContentView: View {
                     // model, no schema version). Before this a finished workout was visible exactly
                     // once — on the summary screen — which is the other half of the tester's "it
                     // ended up in my Apple Health … but I didn't see it in Open Circuit".
-                    RecentWorkoutsCard(reloadToken: workoutHistoryToken)
+                    RecentWorkoutsCard(reloadToken: workoutHistoryToken,
+                                       onWorkoutsChanged: { workoutHistoryToken += 1 })
                     card { GoalsCardView() }
                     // The same four rings, for the days BEFORE today. Derived from the shared trends
                     // cache — no extra fetch, no new stored column (see `GoalHistory`).
@@ -833,6 +835,18 @@ struct ContentView: View {
                     .font(.caption)
             }
             .padding(.top, 4)
+            // OpenCircuit is free with no ads or subscription — this is the one ask, placed next to
+            // the maker credit rather than anywhere it could interrupt actually using the app. Same
+            // destination as the Profile ▸ Settings ▸ About link (`UserProfileSettingsView`).
+            Link(destination: URL(string: "https://buymeacoffee.com/standardsoftware")!) {
+                HStack(spacing: 5) {
+                    Image(systemName: "cup.and.saucer.fill")
+                    Text("Support Development")
+                }
+                .font(.caption.weight(.medium))
+                .foregroundStyle(Theme.accent)
+            }
+            .padding(.top, 10)
         }
         .frame(maxWidth: .infinity)
         .padding(.top, 8)
@@ -1059,13 +1073,13 @@ struct ContentView: View {
         if case .idle = workoutManager.recordingState {} else { return }
         guard session?.workoutHolding != true else { return }
 
-        switch WorkoutSessionRecovery.decide(snapshot: WorkoutSessionManager.persistedSessionSnapshot) {
+        switch WorkoutSessionManager.recoveryDecision(snapshot: WorkoutSessionManager.persistedSessionSnapshot) {
         case .nothingToRecover:
             return
         case .discard(let refusal):
-            // Nothing defensible to save (no observed span, or a future-dated snapshot from a clock
-            // that moved backwards). Drop it silently — asking the user about a workout we could
-            // not describe would be worse than saying nothing.
+            // Nothing defensible to save (no observed span, a future-dated snapshot from a clock
+            // that moved backwards, or a workout the user deleted). Drop it silently — asking the
+            // user about a workout we could not describe would be worse than saying nothing.
             ringLog.notice("workout: discarding orphaned session snapshot (\(refusal.rawValue, privacy: .public))")
             WorkoutSessionManager.clearSessionSnapshot()
         case .offer(let recovered):
@@ -2754,10 +2768,50 @@ private struct QuickLoggedHeadache: Identifiable {
 /// into resting (BMR prorated over the elapsed day) + active (HR/step estimate), then the
 /// static BMR/max-HR reference figures. Body inputs come from the profile page — the ring
 /// transmits none of them.
+///
+/// This wrapper follows the calendar day (#297). The two sheets and their state live HERE, outside the
+/// re-keyed `CurrentDayView`, so a day change never dismisses a Profile edit in progress; the body
+/// is handed the two actions that present them.
 struct CaloriesCardView: View {
+    @State private var showEstimateInfo = false
+    @State private var showProfile = false
+
+    var body: some View {
+        CurrentDayView("calories") {
+            CaloriesCardBody(dayStart: $0,
+                             onSetUpProfile: { showProfile = true },
+                             onShowEstimateInfo: { showEstimateInfo = true })
+        }
+        .sheet(isPresented: $showEstimateInfo) { CaloriesEstimateInfoSheet() }
+        .sheet(isPresented: $showProfile) {
+            NavigationStack {
+                UserProfileSettingsView()
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { showProfile = false }
+                        }
+                    }
+            }
+        }
+    }
+}
+
+private struct CaloriesCardBody: View {
+    /// The day this instance was built for; `CurrentDayView` re-creates it when the day changes (#297).
+    private let dayStart: Date
+    private let onSetUpProfile: () -> Void
+    private let onShowEstimateInfo: () -> Void
     // Shared @AppStorage keys with UserProfileSettingsView (single source of truth).
     @AppStorage("userProfile.age") private var age = 35
     @AppStorage("userProfile.weightKg") private var weightKg = 70.0
+    // #284: manual-entry date + cached latest Apple Health body mass; the newer one feeds the math.
+    @AppStorage(WeightResolver.Keys.manualSetAt) private var weightSetAtEpoch = 0.0
+    @AppStorage(WeightResolver.Keys.healthKg) private var healthWeightKg = 0.0
+    @AppStorage(WeightResolver.Keys.healthAt) private var healthWeightAtEpoch = 0.0
+    private var effectiveWeightKg: Double {
+        WeightResolver.resolve(manualKg: weightKg, manualSetAtEpoch: weightSetAtEpoch,
+                               healthKg: healthWeightKg, healthAtEpoch: healthWeightAtEpoch).kg
+    }
     @AppStorage("userProfile.heightCm") private var heightCm = 170.0
     @AppStorage("userProfile.sex") private var sexRaw = BiologicalSex.male.rawValue
 
@@ -2773,19 +2827,18 @@ struct CaloriesCardView: View {
     /// rings and Apple Health can never disagree.
     @Query private var recentStepSamples: [StoredStepSample]
 
-    init() {
-        let hr = MetricKind.heartRate.rawValue
-        let dayStart = Calendar.current.startOfDay(for: Date())
+    init(dayStart: Date, onSetUpProfile: @escaping () -> Void, onShowEstimateInfo: @escaping () -> Void) {
+        self.dayStart = dayStart
+        self.onSetUpProfile = onSetUpProfile
+        self.onShowEstimateInfo = onShowEstimateInfo
         let stepsFrom = dayStart.addingTimeInterval(-86_400)
         _recentStepSamples = Query(
             filter: #Predicate<StoredStepSample> { $0.start >= stepsFrom },
             sort: \.start)
-        // Match GoalsCardView's HR query exactly: same start-of-day lower bound AND the `value > 0`
+        // Match GoalsCardView's HR query exactly: same one-day window AND the `value > 0`
         // guard, so a stray 0-bpm sample can't skew the active-calorie estimate and the two cards
         // read the same today's-HR set.
-        _hrSamples = Query(
-            filter: #Predicate { $0.kindRaw == hr && $0.start >= dayStart && $0.value > 0 },
-            sort: \.start)
+        _hrSamples = Query(GoalsCardQueries.heartRate(dayStart: dayStart))
         _todayDaily = Query(filter: #Predicate<StoredDaily> { $0.day == dayStart }, sort: \.day)
         var sleepDesc = FetchDescriptor<StoredSleepSummary>(
             sortBy: [SortDescriptor(\.night, order: .reverse)])
@@ -2802,12 +2855,14 @@ struct CaloriesCardView: View {
     /// Identity for the recompute `.task` — the HR count, today's steps, and the profile inputs.
     private var caloriesInputsKey: String {
         "\(hrSamples.count)|\(todayDaily.first?.steps ?? 0)|\(recentStepSamples.count)|"
-        + "\(age)|\(weightKg)|\(heightCm)|\(sexRaw)|"
-        + "\(latestSleep.first?.night.timeIntervalSince1970 ?? 0)"
+        + "\(age)|\(effectiveWeightKg)|\(heightCm)|\(sexRaw)|"
+        + "\(latestSleep.first?.night.timeIntervalSince1970 ?? 0)|\(workoutCreditsRevision)"
     }
+    /// Bumped when a deleted workout's credited span is undone (#293), so the estimate recomputes.
+    @AppStorage(HealthKitWriter.workoutCreditsRevisionKey) private var workoutCreditsRevision = 0
 
     private var profile: UserProfile {
-        UserProfile(age: age, weightKg: max(weightKg, 1), heightCm: max(heightCm, 1),
+        UserProfile(age: age, weightKg: max(effectiveWeightKg, 1), heightCm: max(heightCm, 1),
                     sex: BiologicalSex(rawValue: sexRaw) ?? .male)
     }
     private var maxHR: Int { max(220 - age, 1) }
@@ -2834,8 +2889,25 @@ struct CaloriesCardView: View {
             Text("Resting \(Int(restingToday.rounded())) · Active (est.) \(Int(cachedActiveKcal.rounded()))")
                 .font(.caption).foregroundStyle(.secondary)
             // "max HR" here is the 220-age zone/calorie reference, NOT an observed peak.
-            Text("BMR \(Int(Calories.bmrKcalPerDay(profile: profile).rounded())) kcal/day · est. max HR \(maxHR) bpm (220 − age)")
+            let defaultsNow = ProfileDefaultsStatus.current()
+            Text(CaloriesReferenceLine.text(bmr: Int(Calories.bmrKcalPerDay(profile: profile).rounded()),
+                                            maxHR: maxHR, age: age, status: defaultsNow))
                 .font(.caption2).foregroundStyle(.secondary)
+            HStack(spacing: 12) {
+                // Buttons, never a NavigationLink: inside the Today List a link is hoisted to the
+                // whole row and a tap anywhere on the card would open Profile.
+                if defaultsNow.anyDefault {
+                    Button(action: onSetUpProfile) {
+                        Text("Set Up Profile").font(.caption2.weight(.semibold))
+                    }
+                    .buttonStyle(.borderless)
+                }
+                Button(action: onShowEstimateInfo) {
+                    Label("How These Are Estimated", systemImage: "info.circle")
+                        .font(.caption2.weight(.semibold))
+                }
+                .buttonStyle(.borderless)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         // Recompute the active-kcal estimate OFF the main actor (0x8BADF00D fix). d338484 moved this
@@ -2856,6 +2928,9 @@ struct CaloriesCardView: View {
                 StepWindow(start: $0.start, end: $0.end, delta: $0.delta)
             }
             let dayStart = Calendar.current.startOfDay(for: Date())
+            // #281 motion gate (off by default): the ring's own activity sessions.
+            let activityIntervals = RingActivityEventLedger.load().corroboratingIntervals(now: Date())
+            let creditedWorkoutIntervals = HealthKitWriter.workoutCreditedSpans(day: dayStart)
             cachedActiveKcal = await Task.detached {
                 Calories.dailyEstimate(
                     hrSamples: samples,
@@ -2863,9 +2938,13 @@ struct CaloriesCardView: View {
                     profile: profile,
                     sleepWindow: sleepWindow,
                     stepWindows: stepWindows,
-                    dayStart: dayStart
+                    dayStart: dayStart,
+                    activityIntervals: activityIntervals,
+                    creditedWorkoutIntervals: creditedWorkoutIntervals
                 ).activeKcal
             }.value
         }
+        // #284: refresh the cached Apple Health body mass (lazy, read-only, silent when unavailable).
+        .task { await HealthKitWeightReader().refreshCache() }
     }
 }

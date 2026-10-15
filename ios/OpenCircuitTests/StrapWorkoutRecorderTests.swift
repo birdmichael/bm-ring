@@ -139,6 +139,9 @@ final class StrapWorkoutRecorderTests: XCTestCase {
         let store: FakeHRStore
     }
 
+    /// Deleted workouts (#293), in a defaults suite of this test's own.
+    private let tombstones = WorkoutTombstones(UserDefaults(suiteName: "strap-workout-tombstones-\(UUID().uuidString)")!)
+
     private func makeRig(source: @escaping @MainActor () -> (any StrapWorkoutHeartRateSource)?,
                          journal: MemoryJournal? = nil, store: FakeHRStore? = nil,
                          vo2: FakeVO2? = nil) -> Rig {
@@ -150,6 +153,7 @@ final class StrapWorkoutRecorderTests: XCTestCase {
         let recorder = StrapWorkoutRecorder(source: source, health: health, journal: journal, hrStore: { store },
                                             location: location, liveActivity: nil, profile: { profile },
                                             indoorKeepAlive: { false }, orphanStop: orphanStop, vo2: vo2,
+                                            tombstones: tombstones,
                                             clock: { [unowned self] in self.now }, autoTick: false, managesIdleTimer: false)
         return Rig(recorder: recorder, health: health, journal: journal, location: location, store: store)
     }
@@ -439,6 +443,38 @@ final class StrapWorkoutRecorderTests: XCTestCase {
         XCTAssertNil(third.recorder.recoverable)
     }
 
+    /// #293: an interrupted workout over a stretch the user deleted from the history is dropped, never
+    /// offered back (the running journal and a parked one alike).
+    func testAnInterruptedWorkoutOverADeletedWorkoutIsNotOfferedBack() async throws {
+        let journal = MemoryJournal()
+        let source = makeSource()
+        do {
+            let first = makeRig(source: { source }, journal: journal)
+            first.recorder.start()
+            await stream(first, source, from: 0, to: 120, bpm: 140)
+        }
+        now = at(4000)
+        let probe = makeRig(source: { source }, journal: journal)
+        probe.recorder.resolveOrphan()
+        let offered = try XCTUnwrap(probe.recorder.recoverable, "offered before the delete")
+        probe.recorder.postponeRecovered()
+        let interrupted = try XCTUnwrap(journal.journal)
+
+        tombstones.record(start: offered.ledger.start, end: offered.end)
+        let relaunch = makeRig(source: { source }, journal: journal)
+        relaunch.recorder.resolveOrphan()
+        XCTAssertNil(relaunch.recorder.recoverable)
+        XCTAssertNil(journal.journal, "the running journal is dropped")
+        XCTAssertEqual(relaunch.health.writes.count, 0)
+
+        // The same, parked aside by a later workout's start.
+        journal.parked = [StrapWorkoutParked(journal: interrupted, samples: offered.samples)]
+        let again = makeRig(source: { source }, journal: journal)
+        again.recorder.resolveOrphan()
+        XCTAssertNil(again.recorder.recoverable)
+        XCTAssertTrue(journal.parked.isEmpty, "a parked one is dropped too")
+    }
+
     func testDiscardAndNotNow() async throws {
         let journal = MemoryJournal()
         let source = makeSource()
@@ -524,6 +560,174 @@ final class StrapWorkoutRecorderTests: XCTestCase {
         let after = makeRig(source: { source }, journal: journal)
         after.recorder.resolveOrphan()
         XCTAssertNil(after.recorder.recoverable)
+    }
+
+    // MARK: The interrupted-workout alert (#296), through the entry points the view uses
+
+    /// A workout killed mid-run, journaled as the running slot, and the next launch's recorder with it
+    /// on offer.
+    private func interruptedLaunch(_ source: FakeHRSource, journal: MemoryJournal) async throws -> Rig {
+        do {
+            let dead = makeRig(source: { source }, journal: journal)
+            dead.recorder.selectedSport = .runningIndoor
+            dead.recorder.start()
+            await stream(dead, source, from: 0, to: 60, bpm: 140)
+        }
+        now = at(3600)
+        let launch = makeRig(source: { source }, journal: journal)
+        launch.recorder.resolveOrphan()
+        _ = try XCTUnwrap(launch.recorder.recoverable, "offered at the launch")
+        return launch
+    }
+
+    private func alert(_ rig: Rig, onSaved: @escaping @MainActor () -> Void = {}) -> StrapRecoveryAlert {
+        StrapRecoveryAlert(recorder: rig.recorder, onSaved: onSaved)
+    }
+
+    func testSaveThenTheDismissalWritesOnceAndClearsTheSlot() async throws {
+        let journal = MemoryJournal()
+        let source = makeSource()
+        let launch = try await interruptedLaunch(source, journal: journal)
+        var savedCalls = 0
+        let alert = alert(launch) { savedCalls += 1 }
+        launch.health.duringSave = {
+            // A kill here must neither offer it again nor lose its readings.
+            XCTAssertNil(journal.journal, "the journal is dropped before the Health write")
+            XCTAssertEqual(journal.landing.first?.samples.count, 60, "the readings are queued before it")
+        }
+
+        let write = alert.save()                 // the button's action
+        XCTAssertNil(journal.journal, "taken the moment Save is tapped, before its Task runs")
+        alert.setPresented(false)                // then the alert's dismissal
+        XCTAssertFalse(alert.isPresented)
+        await write?.value
+
+        XCTAssertEqual(launch.health.writes.count, 1, "exactly one HKWorkout write")
+        XCTAssertEqual(launch.health.writes.first?.samples.count, 60)
+        XCTAssertEqual(savedCalls, 1)
+        XCTAssertNil(journal.journal)
+        XCTAssertEqual(launch.store.inserted.count, 60)
+        let next = makeRig(source: { source }, journal: journal)
+        next.recorder.resolveOrphan()
+        XCTAssertNil(next.recorder.recoverable, "never offered again")
+    }
+
+    func testTheDismissalThenSaveStillWritesOnce() async throws {
+        let journal = MemoryJournal()
+        let source = makeSource()
+        let launch = try await interruptedLaunch(source, journal: journal)
+        let alert = alert(launch)
+
+        alert.setPresented(false)                // the dismissal first
+        XCTAssertFalse(alert.isPresented)
+        let write = alert.save()                 // then the button's action: the user's Save wins
+        alert.setPresented(false)
+        await write?.value
+
+        XCTAssertEqual(launch.health.writes.count, 1)
+        XCTAssertNil(journal.journal)
+        XCTAssertNil(alert.save(), "answered: a second Save has nothing to take")
+        XCTAssertEqual(launch.health.writes.count, 1)
+        let next = makeRig(source: { source }, journal: journal)
+        next.recorder.resolveOrphan()
+        XCTAssertNil(next.recorder.recoverable)
+    }
+
+    func testNotNowAloneIsOfferedAgainAtTheNextLaunch() async throws {
+        let journal = MemoryJournal()
+        let source = makeSource()
+        let launch = try await interruptedLaunch(source, journal: journal)
+        let alert = alert(launch)
+
+        alert.notNow()
+        alert.setPresented(false)
+        XCTAssertFalse(alert.isPresented)
+        XCTAssertEqual(launch.health.writes.count, 0)
+        XCTAssertNotNil(journal.journal, "kept")
+
+        now = at(7200)
+        let next = makeRig(source: { source }, journal: journal)
+        next.recorder.resolveOrphan()
+        let offered = try XCTUnwrap(next.recorder.recoverable, "asked again")
+        XCTAssertEqual(offered.samples.count, 60)
+    }
+
+    func testSavingAParkedWorkoutClearsOnlyThatEntry() async throws {
+        let journal = MemoryJournal()
+        let source = makeSource()
+        _ = try await interruptedLaunch(source, journal: journal)
+        let kept = StrapWorkoutParked(journal: try XCTUnwrap(journal.journal), samples: journal.samples)
+        // Two parked: the launch offers the first; the second stays for later.
+        let other = StrapWorkoutParked(
+            journal: StrapWorkoutJournal(sport: .yoga, ledger: WorkoutActivityLedger(start: at(1000)),
+                                         lastAliveAt: at(1030), timelineRaw: source.timeline.rawValue),
+            samples: (1...30).map { HRSample(bpm: 90, start: at(1000 + Double($0) - 1), end: at(1000 + Double($0))) })
+        journal.journal = nil
+        journal.samples = []
+        journal.parked = [kept, other]
+        let relaunch = makeRig(source: { source }, journal: journal)
+        relaunch.recorder.resolveOrphan()
+        XCTAssertEqual(relaunch.recorder.recoverable?.samples.count, 60, "the first parked one")
+
+        let alert = alert(relaunch)
+        let write = alert.save()
+        alert.setPresented(false)
+        await write?.value
+
+        XCTAssertEqual(relaunch.health.writes.count, 1)
+        XCTAssertEqual(journal.parked, [other], "only the saved entry is gone")
+        let next = makeRig(source: { source }, journal: journal)
+        next.recorder.resolveOrphan()
+        XCTAssertEqual(next.recorder.recoverable?.samples.count, 30, "the other one is still offered")
+    }
+
+    func testDiscardThenTheDismissalClearsTheSlot() async throws {
+        let journal = MemoryJournal()
+        let source = makeSource()
+        let launch = try await interruptedLaunch(source, journal: journal)
+        let alert = alert(launch)
+
+        alert.discard()
+        alert.setPresented(false)
+
+        XCTAssertNil(journal.journal)
+        XCTAssertEqual(launch.health.writes.count, 0)
+        let next = makeRig(source: { source }, journal: journal)
+        next.recorder.resolveOrphan()
+        XCTAssertNil(next.recorder.recoverable)
+    }
+
+    func testTheDismissalThenDiscardStillClearsTheSlot() async throws {
+        let journal = MemoryJournal()
+        let source = makeSource()
+        let launch = try await interruptedLaunch(source, journal: journal)
+        let alert = alert(launch)
+
+        alert.setPresented(false)
+        alert.discard()
+
+        XCTAssertNil(journal.journal)
+        XCTAssertEqual(launch.health.writes.count, 0)
+    }
+
+    /// A put-off offer is not answerable once a new workout has parked its journal: its slot no longer
+    /// points at it, and a late Save would drop the new workout's journal instead.
+    func testAPutOffOfferIsNotAnsweredAfterANewWorkoutStarts() async throws {
+        let journal = MemoryJournal()
+        let source = makeSource()
+        let launch = try await interruptedLaunch(source, journal: journal)
+        let alert = alert(launch)
+
+        alert.notNow()
+        launch.recorder.start()
+        await stream(launch, source, from: 3600, to: 3610, bpm: 120)
+        XCTAssertNil(alert.save())
+        alert.discard()
+
+        XCTAssertEqual(launch.health.writes.count, 0)
+        XCTAssertNotNil(journal.journal, "the new workout's journal is untouched")
+        XCTAssertEqual(journal.parked.count, 1, "the interrupted one is still set aside")
+        await launch.recorder.end()
     }
 
     // MARK: The link drops mid-workout

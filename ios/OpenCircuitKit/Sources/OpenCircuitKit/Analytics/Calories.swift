@@ -234,6 +234,12 @@ public enum Calories {
     /// computed a zero delta on every flush for 5.5 hours, and Apple Health showed a hard stop at
     /// 2pm (2026-07-28). Attribution pays each channel where it actually earned, so a sedentary-HR
     /// afternoon of walking still accrues.
+    ///
+    /// `activityIntervals` + `corroborateMotion` feed the #281 motion gate
+    /// (`ExerciseMinutes.motionCorroborationEnabled`, OFF). Its evidence is `stepWindows` plus
+    /// `activityIntervals` (the ring's own activity sessions,
+    /// `RingActivityEventLedger.corroboratingIntervals`). Both paths below get the SAME evidence, so
+    /// the degrade path can't be the one that still prices a seated hour.
     public static func dailyEstimate(
         hrSamples: [HRSample],
         steps: Int,
@@ -241,8 +247,14 @@ public enum Calories {
         sleepWindow: DateInterval? = nil,
         stepWindows: [StepWindow] = [],
         dayStart: Date? = nil,
-        bucketSeconds: TimeInterval = energyBucketSeconds
+        bucketSeconds: TimeInterval = energyBucketSeconds,
+        activityIntervals: [DateInterval] = [],
+        creditedWorkoutIntervals: [DateInterval] = [],
+        corroborateMotion: Bool = ExerciseMinutes.motionCorroborationEnabled
     ) -> DailyEstimate {
+        let motion = ExerciseMinutes.MotionEvidence(stepWindows: stepWindows,
+                                                    activityIntervals: activityIntervals,
+                                                    creditedWorkoutIntervals: creditedWorkoutIntervals)
         if let dayStart, bucketSeconds > 0, steps == 0 || !stepWindows.isEmpty,
            let attributed = attributedDailyEstimate(hrSamples: hrSamples,
                                                     steps: steps,
@@ -250,43 +262,48 @@ public enum Calories {
                                                     sleepWindow: sleepWindow,
                                                     stepWindows: stepWindows,
                                                     dayStart: dayStart,
-                                                    bucketSeconds: bucketSeconds) {
+                                                    bucketSeconds: bucketSeconds,
+                                                    motion: motion,
+                                                    corroborateMotion: corroborateMotion) {
             return attributed
         }
         return legacyDailyEstimate(hrSamples: hrSamples, steps: steps,
-                                   profile: profile, sleepWindow: sleepWindow)
+                                   profile: profile, sleepWindow: sleepWindow,
+                                   motion: motion, corroborateMotion: corroborateMotion)
     }
 
     /// The pre-attribution estimate, kept verbatim as the degrade path (and as the thing the
     /// attribution tests assert they still reproduce for steps-only / HR-only days).
+    ///
+    /// `motion` is the #281 gate's evidence. With the gate off (`corroborateMotion` false) every
+    /// elevated reading counts and the result is byte-identical to before the gate existed.
     public static func legacyDailyEstimate(
         hrSamples: [HRSample],
         steps: Int,
         profile: UserProfile,
-        sleepWindow: DateInterval? = nil
+        sleepWindow: DateInterval? = nil,
+        motion: ExerciseMinutes.MotionEvidence = ExerciseMinutes.MotionEvidence(),
+        corroborateMotion: Bool = ExerciseMinutes.motionCorroborationEnabled
     ) -> DailyEstimate {
         let maxHR = max(220 - profile.age, 1)
-        let elevatedMinutes = ExerciseMinutes.estimate(
+
+        // The minutes AND the qualifying bpm come from ONE list of elevated readings, so they always
+        // share a threshold and a gate verdict. Until #281 this re-derived the threshold by hand,
+        // which had to go through `effectiveRestingBaseline` to stay in step: a hybrid (old-model
+        // minutes ÷ new-model qualifying samples) mis-prices the day by up to +40 % while both
+        // halves stay individually self-consistent, so no test catches it. A hand-rolled motion
+        // filter here would reopen exactly that, so the gate is applied inside
+        // `elevatedIntervals` and nowhere else. With the gate off every interval is corroborated:
+        // the same readings and the same Int sum as before, so the same average.
+        let counted = ExerciseMinutes.elevatedIntervals(
             hrSamples: hrSamples,
             maxHR: maxHR,
-            sleepWindow: sleepWindow
-        )
-
-        // MUST be the same threshold `elevatedPieces` just used inside `estimate` above — it is
-        // derived from these same samples, so re-deriving it here reproduces it exactly. Calling
-        // the bare `threshold(maxHR:)` would price a DIFFERENT qualifying set than the minutes it
-        // divides by, silently mixing two models in one kcal number.
-        // MUST go through `effectiveRestingBaseline`, never `restingBaseline` directly — the latter
-        // ignores the kill-switch, and a hybrid (old-model minutes ÷ new-model qualifying samples)
-        // mis-prices the day by up to +40 % while both halves stay individually self-consistent, so
-        // no test catches it.
-        let threshold = ExerciseMinutes.threshold(
-            maxHR: maxHR, restingHR: ExerciseMinutes.effectiveRestingBaseline(hrSamples))
-        let qualifyingBPM = hrSamples.compactMap { sample -> Int? in
-            guard sample.bpm >= threshold,
-                  sleepWindow.map({ !$0.contains(sample.start) }) ?? true else { return nil }
-            return sample.bpm
-        }
+            sleepWindow: sleepWindow,
+            motion: ExerciseMinutes.effectiveMotionEvidence(motion, corroborate: corroborateMotion)
+        ).filter(\.corroborated)
+        let elevatedMinutes = ExerciseMinutes.pieces(sweeping: counted)
+            .reduce(0.0) { $0 + $1.seconds } / 60.0
+        let qualifyingBPM = counted.map(\.bpm)
         let hrKcal: Double
         if elevatedMinutes > 0, !qualifyingBPM.isEmpty {
             let average = Int((Double(qualifyingBPM.reduce(0, +))
@@ -328,12 +345,18 @@ public enum Calories {
         sleepWindow: DateInterval?,
         stepWindows: [StepWindow],
         dayStart: Date,
-        bucketSeconds: TimeInterval
+        bucketSeconds: TimeInterval,
+        motion: ExerciseMinutes.MotionEvidence = ExerciseMinutes.MotionEvidence(),
+        corroborateMotion: Bool = ExerciseMinutes.motionCorroborationEnabled
     ) -> DailyEstimate? {
         let maxHR = max(220 - profile.age, 1)
+        // #281: a gated reading is simply not a piece. Everything below is untouched, so its steps
+        // (if any) are credited in full as walking energy, as for any other non-elevated time.
         let pieces = ExerciseMinutes.elevatedPieces(hrSamples: hrSamples,
                                                     maxHR: maxHR,
-                                                    sleepWindow: sleepWindow)
+                                                    sleepWindow: sleepWindow,
+                                                    motion: motion,
+                                                    corroborateMotion: corroborateMotion)
         let elevatedMinutes = pieces.reduce(0.0) { $0 + $1.seconds } / 60.0
         let dayEnd = dayStart.addingTimeInterval(maxAttributionSeconds)
 
@@ -479,10 +502,25 @@ public enum Calories {
     /// Keytel 2005 energy expenditure (kJ·min⁻¹), W = body mass kg, A = age years:
     ///   men:   −55.0969 + 0.6309·HR + 0.1988·W + 0.2017·A
     ///   women: −20.4022 + 0.4472·HR − 0.1263·W + 0.0740·A
-    /// kcal = kJ / 4.184. The per-minute rate is clamped to ≥ 0 (a very low HR yields a negative raw
-    /// rate). Returns 0 for a non-positive HR or duration.
+    /// kcal = kJ / 4.184.
+    ///
+    /// NET OF RESTING ENERGY. Keytel predicts GROSS expenditure: everything burned in that minute,
+    /// resting metabolism included. Apple Health's Active Energy is energy ABOVE resting, and this app
+    /// already writes the resting part every hour as Resting Energy (`basalKcalPerHour`). Writing the
+    /// gross figure as active therefore counted the same resting kcal twice, once in each type, and
+    /// Health's Total summed both. So the per-minute rate here is Keytel minus the profile's resting
+    /// rate (`bmrKcalPerDay / 1440`), clamped to ≥ 0. At low heart rates the net rate is near zero,
+    /// so a raw rate that is negative or just above rest gives 0. Returns 0 for a non-positive HR or
+    /// duration.
     public static func workoutActiveKcal(avgHR: Int, durationSeconds: Double, profile: UserProfile) -> Double {
         guard avgHR > 0, durationSeconds > 0 else { return 0 }
+        let net = keytelGrossKcalPerMinute(avgHR: avgHR, profile: profile) - restingKcalPerMinute(profile: profile)
+        return max(0, net) * (durationSeconds / 60.0)
+    }
+
+    /// The raw Keytel (2005) gross rate in kcal/min, before resting energy is taken off. Can be
+    /// negative at very low HR. Exposed so the formula itself stays pinned by tests.
+    public static func keytelGrossKcalPerMinute(avgHR: Int, profile: UserProfile) -> Double {
         let hr = Double(avgHR)
         let w = profile.weightKg
         let a = Double(profile.age)
@@ -491,7 +529,11 @@ public enum Calories {
         case .male:   kJPerMin = -55.0969 + 0.6309 * hr + 0.1988 * w + 0.2017 * a
         case .female: kJPerMin = -20.4022 + 0.4472 * hr - 0.1263 * w + 0.0740 * a
         }
-        let kcalPerMin = max(0, kJPerMin / 4.184)
-        return kcalPerMin * (durationSeconds / 60.0)
+        return kJPerMin / 4.184
+    }
+
+    /// Resting energy per minute, from the same Mifflin-St Jeor BMR the hourly Resting Energy writes use.
+    public static func restingKcalPerMinute(profile: UserProfile) -> Double {
+        bmrKcalPerDay(profile: profile) / 1440.0
     }
 }
